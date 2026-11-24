@@ -17,7 +17,17 @@ func TestSirilProcessesJPEGSequence(t *testing.T) {
 	if cli == "" {
 		t.Skip("portable Siril is required for this integration test")
 	}
-	root := t.TempDir()
+	root, err := os.MkdirTemp("", "tod-siril-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Some Siril distributions keep background helpers in the working
+		// directory until the runner closes them. The runner owns this temp tree.
+		if err := os.RemoveAll(root); err != nil {
+			t.Logf("Runner will clean Siril's temporary directory: %v", err)
+		}
+	})
 	session := filepath.Join(root, "Synthetic field")
 	lights := filepath.Join(session, "Light")
 	if err := os.MkdirAll(lights, 0755); err != nil {
