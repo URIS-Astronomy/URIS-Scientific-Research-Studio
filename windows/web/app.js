@@ -1,7 +1,7 @@
 const $=id=>document.getElementById(id);let state=null,lastFocus=0,modeSignature="",awbSignature="";
 const hints={'Validation / Daylight':'Camera quality baseline with automatic exposure and focus',Capture:'Live telescope feed and camera control',Planetary:'Lucky-imaging workflow for Jupiter, Saturn and Mars','Lunar / Solar':'Surface-detail capture with clipping and focus aids','Deep Sky':'RAW still sequences, calibration frames and long-exposure sessions','Live Stack':'Register and stack light frames',Focus:'Large, readable focus metrics at the telescope',Sessions:'Target, files, telemetry and processing history'};
 async function api(path, body) {
-  const options = {signal: AbortSignal.timeout(12000), cache: 'no-store'};
+  const options = {signal: AbortSignal.timeout(path === '/api/state' ? 2500 : 12000), cache: 'no-store'};
   if (body !== undefined) {
     options.method = 'POST';
     options.headers = {'Content-Type':'application/json'};
@@ -175,7 +175,7 @@ let displayedCount=0, fpsStart=performance.now(), lastDisplayed=-Infinity;
 function renderPreviewHealth() {
   const connected = serverOnline && state?.device?.connected;
   const stack = currentMode()==='Live Stack' && $('showStack').checked && state?.stack?.accepted;
-  const live = connected && state.metrics.live && performance.now()-lastDisplayed <= 3000;
+  const live = performance.now()-lastDisplayed <= 3000;
   const visible = !!(stack || live);
   $('fpsBadge').title = state?.metrics.last_frame ?
     'Last frame received at ' + new Date(state.metrics.last_frame).toLocaleTimeString() : '';
@@ -218,7 +218,7 @@ async function refreshPreview() {
       lastStackCount=state.stack.accepted;
     } else {
       lastStackCount=0;
-      if (serverOnline && state?.device?.connected) {
+      if (state?.device?.connected) {
         const headers=previewTag ? {'If-None-Match':previewTag} : {};
         const response=await fetch('/api/preview.jpg',{headers,signal:AbortSignal.timeout(2000)});
         if(response.status===200) {
