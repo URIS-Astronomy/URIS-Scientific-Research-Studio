@@ -14,6 +14,10 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.StatFs
 import android.view.TextureView
+import android.hardware.display.DisplayManager
+import android.graphics.ImageDecoder
+import android.widget.ImageView
+import android.graphics.drawable.GradientDrawable
 import android.view.GestureDetector
 import android.view.ScaleGestureDetector
 import android.view.MotionEvent
@@ -51,6 +55,20 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     @Volatile private var astroServer: AstroServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private val ui = Handler(Looper.getMainLooper())
+    private var lastJpeg: File? = null
+    private var lastJpegLabel = ""
+    private var marker: android.view.View? = null
+    private val photoReview = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val displayListener = object: DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (preview.display?.displayId == displayId) {
+                marker?.visibility = android.view.View.GONE
+                cameraController?.refreshTransform()
+            }
+        }
+    }
     private var exiting = false
 
     private val telemetryTask = object : Runnable {
@@ -60,8 +78,20 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val camera = cameraController
             histogram.update(camera?.previewHistogram ?: IntArray(0))
             val measured = camera?.measured()
+            val diag = camera?.diagnostics()
+            val actualFps = camera?.previewFPS() ?: 0.0
+            val available = diag?.optBoolean("tap_focus") == true
+            findViewById<Button>(R.id.focusScene).isEnabled = available
+            val main = when(diag?.opt("main_rear")) { true -> "main rear"; false -> "other rear"; else -> "physical lens unreported" }
+            if (diag != null) cameraBadge.text = "${diag.optString("profile_name")} • camera ${diag.optString("camera_id")}" +
+                " / ${diag.optString("active_physical_id").replace("null","—")} • $main" +
+                "\nPreview ${diag.optInt("preview_width")}×${diag.optInt("preview_height")} • ${"%.1f".format(Locale.US,actualFps)} FPS" +
+                "\nJPEG ${diag.optInt("jpeg_width")}×${diag.optInt("jpeg_height")} • sensor ${diag.optInt("sensor_orientation")}° / display ${diag.optInt("display_rotation")}°"
             previewFramesLabel.text = "Preview frames ${camera?.previewFrames?.get() ?: 0}" +
-                if ((measured?.optLong("exposure_us",0L) ?: 0L) > 0) " • ISO ${measured?.optInt("iso")} • ${measured?.optLong("exposure_us")} µs" else ""
+                if ((measured?.optLong("exposure_us",0L) ?: 0L) > 0) " • ISO ${measured?.optInt("iso")} • ${exposureLabel(measured?.optDouble("exposure_us") ?: 0.0)}" else ""
+            if (diag != null) previewFramesLabel.append(" • ${diag.optString("focus")} " +
+                (measured?.optDouble("focus_distance")?.takeIf { it.isFinite() }?.let { " %.2f D".format(Locale.US,it) } ?: "") +
+                " • OIS ${measured?.optString("ois","—")} / EIS ${measured?.optString("eis","—")}")
             telemetry.text = "Battery ${t.optInt("battery_percent", 0)}%${if (t.optBoolean("charging")) " ⚡" else ""} • Temp ${"%.1f".format(t.optDouble("temperature_c", 0.0))}°C • Free ${"%.1f".format(t.optDouble("free_storage_gb", 0.0))} GB"
             astroServer?.sendEvent(JSONObject(t.toString()).put("event", "telemetry"))
             ui.postDelayed(this, 2000)
@@ -90,6 +120,22 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         telemetry = findViewById(R.id.telemetry)
         cameraBadge = findViewById(R.id.cameraBadge)
         preview.surfaceTextureListener = this
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener,ui)
+        findViewById<Button>(R.id.validationJpeg).setOnClickListener {
+            val camera = cameraController ?: return@setOnClickListener
+            val result = camera.validationJpeg()
+            if (result.optBoolean("ok")) marker?.visibility = android.view.View.GONE
+            showCommandResult(result,"Capturing native validation JPEG…")
+        }
+        findViewById<Button>(R.id.previewQuality).setOnClickListener { showPreviewQuality() }
+        findViewById<Button>(R.id.reviewJpeg).setOnClickListener { showSavedJpeg() }
+        findViewById<Button>(R.id.focusScene).setOnClickListener {
+            if (cameraController?.focusScene()==true) {
+                val frame=findViewById<android.view.View>(R.id.previewFrame)
+                showFocusMarker(frame.width/2f,frame.height/2f)
+                status.text="Focusing on the center"
+            }
+        }
         findViewById<Button>(R.id.exitButton).setOnClickListener { confirmExit() }
 
         findViewById<Button>(R.id.cameraControls).setOnClickListener { showCameraControls() }
@@ -151,6 +197,61 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
     }
 
+    private fun exposureLabel(us: Double): String {
+        if (!us.isFinite() || us<=0) return "—"
+        val seconds=us/1_000_000
+        val descriptor=if(seconds>=.25) "%.2f s".format(Locale.US,seconds)
+            else "1/${kotlin.math.round(1/seconds).toLong()} s"
+        return "%.1f µs (%s)".format(Locale.US,us,descriptor)
+    }
+
+    private fun showPreviewQuality() {
+        val camera = cameraController ?: return
+        val presets = com.tod.astrophotography.camera.ValidationPolicy.Preview.entries
+        AlertDialog.Builder(this).setTitle("USB preview quality")
+            .setSingleChoiceItems(presets.map { it.label }.toTypedArray(),
+                presets.indexOfFirst { it.name == camera.diagnostics().optString("preview_quality") }) { dialog,index ->
+                showCommandResult(camera.setControls(JSONObject().put("preview_quality",presets[index].name)),"Updating preview stream…")
+                dialog.dismiss()
+            }.setNegativeButton("Cancel",null).show()
+    }
+
+    private fun showFocusMarker(x: Float,y: Float) {
+        val frame=findViewById<android.widget.FrameLayout>(R.id.previewFrame)
+        val size=(52*resources.displayMetrics.density).toInt()
+        val view=marker ?: android.view.View(this).apply {
+            background=GradientDrawable().apply {
+                setColor(android.graphics.Color.TRANSPARENT)
+                setStroke(2,0xffffcf69.toInt())
+                cornerRadius=5f
+            }
+            frame.addView(this,android.widget.FrameLayout.LayoutParams(size,size))
+            marker=this
+        }
+        view.translationX=x-size/2-frame.paddingLeft
+        view.translationY=y-size/2-frame.paddingTop
+        view.visibility=android.view.View.VISIBLE
+    }
+
+    private fun showSavedJpeg() {
+        val file = lastJpeg ?: return
+        val label = lastJpegLabel
+        photoReview.execute {
+            try {
+                val bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(file)) { decoder,info,_ ->
+                    val scale=minOf(1.0,2600.0/maxOf(info.size.width,info.size.height))
+                    decoder.setTargetSize((info.size.width*scale).toInt().coerceAtLeast(1),(info.size.height*scale).toInt().coerceAtLeast(1))
+                }
+                runOnUiThread {
+                    if (exiting || isFinishing) { bitmap.recycle();return@runOnUiThread }
+                    val image=ImageView(this).apply { adjustViewBounds=true; setImageBitmap(bitmap) }
+                    AlertDialog.Builder(this).setTitle(label).setView(image).setPositiveButton("Close",null)
+                        .create().apply { setOnDismissListener { image.setImageDrawable(null); bitmap.recycle() } }.show()
+                }
+            } catch (e: Exception) { runOnUiThread { status.text="Could not review the saved JPEG" } }
+        }
+    }
+
     private fun renderZoom(value: Double) {
         zoomRatio = value
         preview.scaleX = value.toFloat()
@@ -177,6 +278,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         })
         val taps = GestureDetector(this, object: GestureDetector.SimpleOnGestureListener() {
             override fun onDown(event: MotionEvent): Boolean = true
+            override fun onSingleTapConfirmed(event: MotionEvent): Boolean {
+                if (cameraController?.tapToFocus(event.x-preview.left,event.y-preview.top)==true) {
+                    showFocusMarker(event.x,event.y)
+                    status.text="Focusing"
+                    return true
+                }
+                return false
+            }
             override fun onDoubleTap(event: MotionEvent): Boolean {
                 change(1.0)
                 return true
@@ -198,7 +307,19 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             eventSink = { event ->
                 astroServer?.sendEvent(event)
                 when (event.optString("event")) {
-                    "capture_saved" -> runOnUiThread { status.text = "Capture saved" }
+                    "capture_saved" -> runOnUiThread {
+                        status.text = "Capture saved"
+                        val files=event.optJSONArray("files")
+                        val photo=(0 until (files?.length() ?: 0)).mapNotNull { files?.optString(it) }
+                            .firstOrNull { it.endsWith(".jpg",true) }
+                        if (photo != null) {
+                            lastJpeg=File(photo)
+                            lastJpegLabel=event.optString("jpeg_processing","Native JPEG")+
+                                " • ${event.optInt("jpeg_width")}×${event.optInt("jpeg_height")}"
+                            findViewById<Button>(R.id.reviewJpeg).isEnabled=true
+                            if (event.optBoolean("validation_review")) showSavedJpeg()
+                        }
+                    }
                     "capture_error" -> runOnUiThread { status.text = event.optString("message") }
                 }
             },
@@ -216,6 +337,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             return
         }
         val presets = listOf(
+            CapturePreset("Validation / Daylight", null, null, 100),
             CapturePreset("General Manual", null, null, 100),
             CapturePreset("Planetary", 200, 5000, 50),
             CapturePreset("Moon", 100, 2000, 100),
@@ -230,7 +352,10 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 if (preset.name == "Solar") AlertDialog.Builder(this).setTitle("Solar imaging")
                     .setMessage("A proper telescope solar filter fitted over the front aperture is required before pointing at the Sun.")
                     .setPositiveButton("OK",null).show()
-                val settings = JSONObject().put("roi_percent", preset.crop)
+                marker?.visibility = android.view.View.GONE
+                val validation=preset.name == "Validation / Daylight"
+                val settings = JSONObject().put("roi_percent", preset.crop).put("profile",if(validation) "validation" else "astronomy")
+                    .put("profile_name",preset.name).put("reset_profile",true)
                 if (preset.name == "Planetary") {
                     settings.put("ois",false).put("eis",false)
                     val modes = caps.optJSONObject("processing_modes")
@@ -239,7 +364,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                         if ((0 until (values?.length() ?: 0)).any { values?.optInt(it,-1) == 0 }) settings.put(key,0)
                     }
                 }
-                if (caps.optDouble("min_focus_distance") > 0 && preset.name != "General Manual") settings.put("manual_focus",true)
+                if (caps.optDouble("min_focus_distance") > 0 && !validation && preset.name != "General Manual") settings.put("manual_focus",true).put("focus_distance",0)
                 if (manual && preset.iso != null && preset.exposureUs != null) {
                     settings.put("manual", true).put("iso", if (preset.name in listOf("Moon","Solar")) caps.optInt("iso_min",preset.iso) else preset.iso)
                         .put("exposure_us", if (preset.name == "Deep Sky") caps.optLong("exposure_us_max",preset.exposureUs) else preset.exposureUs)
@@ -432,6 +557,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             .put("recording", cameraController?.isRecording() == true)
             .put("display_zoom",cameraController?.previewZoom() ?: 1.0)
             .put("effective",cameraController?.measured() ?: JSONObject())
+            .put("diagnostics",cameraController?.diagnostics() ?: JSONObject())
             .put("focus_settings",cameraController?.focusSettings() ?: JSONObject())
             .put("usb_power", (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0)
             .put("preview_frames", cameraController?.previewFrames?.get() ?: 0)
@@ -454,7 +580,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
     }
-    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) { cameraController?.refreshTransform() }
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
         cameraController?.shutdown()
@@ -496,6 +622,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         cameraController?.shutdown(); cameraController = null
         if (wakeLock?.isHeld == true) wakeLock?.release()
         wakeLock = null
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
+        photoReview.shutdownNow()
         super.onDestroy()
     }
 }

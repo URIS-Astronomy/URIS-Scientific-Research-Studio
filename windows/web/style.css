@@ -13,3 +13,11 @@
 .zoom-toolbar input { flex:1; min-width:75px; }
 .zoom-toolbar output { color:var(--text); min-width:3.2em; font-variant-numeric:tabular-nums; }
 button:disabled { cursor: default; opacity: .55; }
+
+.quality-toolbar { flex-wrap: wrap; }
+.live-diagnostics { display:block; margin:0 12px 5px; line-height:1.35; }
+#jpegReviewDialog { background: #0e1626; color: #e9efff; border: 1px solid #30425d;
+  border-radius: 10px; max-width: 90vw; max-height: 92vh; padding:12px; }
+#jpegReviewDialog::backdrop { background: rgba(0,0,0,.75); }
+#jpegReviewDialog header { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+#jpegReviewImage { display:block; max-width:86vw; max-height:80vh; margin:8px auto 0; object-fit:contain; }

@@ -1,5 +1,5 @@
 const $=id=>document.getElementById(id);let state=null,lastFocus=0,modeSignature="",awbSignature="";
-const hints={Capture:'Live telescope feed and camera control',Planetary:'Lucky-imaging workflow for Jupiter, Saturn and Mars','Lunar / Solar':'Surface-detail capture with clipping and focus aids','Deep Sky':'RAW still sequences, calibration frames and long-exposure sessions','Live Stack':'Register and stack light frames',Focus:'Large, readable focus metrics at the telescope',Sessions:'Target, files, telemetry and processing history'};
+const hints={'Validation / Daylight':'Camera quality baseline with automatic exposure and focus',Capture:'Live telescope feed and camera control',Planetary:'Lucky-imaging workflow for Jupiter, Saturn and Mars','Lunar / Solar':'Surface-detail capture with clipping and focus aids','Deep Sky':'RAW still sequences, calibration frames and long-exposure sessions','Live Stack':'Register and stack light frames',Focus:'Large, readable focus metrics at the telescope',Sessions:'Target, files, telemetry and processing history'};
 async function api(path,body){const opt=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};const r=await fetch(path,opt);let j={};try{j=await r.json()}catch{}if(!r.ok)throw new Error(j.error||r.statusText);return j}
 function setConnected(device) {
   const on = device.connected;
@@ -85,36 +85,113 @@ function renderStack(stack) {
   $('saveStack').hidden = !stack?.accepted;
   $('stackStats').textContent = stack ? `${stack.accepted} accepted · ${stack.rejected} rejected · ${stack.calibrated ? 'calibrated' : 'uncalibrated'} · ${n(stack.integration_us / 1e6, 1)} s` : '';
 }
-let lastStackCount = 0;
-function refreshPreview() {
-  const stacked = currentMode() === 'Live Stack' && $('showStack').checked && state?.stack?.accepted;
-  if (stacked) {
-    if (lastStackCount !== state.stack.accepted) $('preview').src = '/api/stack.png?t=' + Date.now();
-    lastStackCount = state.stack.accepted;
-  } else {
-    lastStackCount = 0;
-    if (state?.device?.connected) $('preview').src = '/api/preview.jpg?t=' + Date.now();
+let lastStackCount=0, previewTag='', previewURL='', displayedFPS=0;
+let displayedCount=0, fpsStart=performance.now();
+async function refreshPreview() {
+  const started=performance.now(), image=$('preview');
+  const stacked = currentMode()==='Live Stack' && $('showStack').checked && state?.stack?.accepted;
+  try {
+    if (stacked) {
+      if (lastStackCount!==state.stack.accepted) {
+        image.src='/api/stack.png?t='+Date.now();
+        if(previewURL)URL.revokeObjectURL(previewURL);
+        previewURL='';previewTag='';
+      }
+      lastStackCount=state.stack.accepted;
+    } else {
+      lastStackCount=0;
+      if (state?.device?.connected) {
+        const headers=previewTag ? {'If-None-Match':previewTag} : {};
+        const response=await fetch('/api/preview.jpg',{headers,signal:AbortSignal.timeout(2000)});
+        if(response.status===200) {
+          const url=URL.createObjectURL(await response.blob());
+          const prior=previewURL;
+          previewURL=url;
+          previewTag=response.headers.get('ETag') || '';
+          image.src=url;
+          if(prior)URL.revokeObjectURL(prior);
+          try { await image.decode(); displayedCount++; } catch {}
+        }
+      } else {
+        if(previewURL)URL.revokeObjectURL(previewURL);
+        previewURL='';previewTag='';
+        image.removeAttribute('src');
+      }
+    }
+  } catch {
+    previewTag='';
+  } finally {
+    const now=performance.now();
+    if(now-fpsStart>=1000) {
+      displayedFPS=displayedCount*1000/(now-fpsStart);
+      fpsStart=now;displayedCount=0;
+    }
+    setTimeout(refreshPreview,Math.max(12,50-(now-started)));
   }
-  setTimeout(refreshPreview, 100);
 }
 let focusEdited=false;
 $('manualFocus').onchange=()=>{focusEdited=true;};
 $('focus').oninput=()=>{focusEdited=true;};
-function postControls(){const processing = Object.fromEntries([...document.querySelectorAll('#processingControls select')].filter(x=>x.value!=='').map(x=>[x.name,+x.value]));const rv=$('roi').value;const rp=rv==='75%'?75:rv==='50%'?50:rv==='25%'?25:100;return api('/api/controls',{...processing,manual:$('manualToggle').checked,iso:+$('iso').value,exposure_us:+$('exposure').value,...((focusEdited && !$('manualFocus').disabled) ? {focus_distance:+$('focus').value,manual_focus:$('manualFocus').checked} : {}),ae_lock:$('aeLock').checked,awb_lock:$('awbLock').checked,ois:$('ois').value,eis:$('eis').value,roi_percent:rp,fixed_color:$('fixedColor').checked,awb_mode:+$('awbMode').value||1}).then(response=>{focusEdited=false;return response;})}
-function currentMode(){return document.querySelector('.nav.active')?.dataset.mode||'Capture'}
+const validationName = 'Validation / Daylight';
+function captureProfile() {
+  const target = $('profile').value;
+  return target === validationName
+    ? {profile:'validation',profile_name:validationName}
+    : {profile:'astronomy',profile_name:target};
+}
+function postControls(){const processing = Object.fromEntries([...document.querySelectorAll('#processingControls select')].filter(x=>x.value!=='').map(x=>[x.name,+x.value]));const rv=$('roi').value;const rp=rv==='75%'?75:rv==='50%'?50:rv==='25%'?25:100;return api('/api/controls',{...captureProfile(),...processing,manual:$('manualToggle').checked,iso:+$('iso').value,exposure_us:+$('exposure').value,...((focusEdited && !$('manualFocus').disabled) ? {focus_distance:+$('focus').value,manual_focus:$('manualFocus').checked} : {}),ae_lock:$('aeLock').checked,awb_lock:$('awbLock').checked,ois:$('ois').value,eis:$('eis').value,roi_percent:rp,fixed_color:$('fixedColor').checked,awb_mode:+$('awbMode').value||1}).then(response=>{focusEdited=false;if(response.manual===true){$('iso').value=response.iso;$('exposure').value=response.exposure_us;}return response;})}
+function currentMode(){return document.querySelector('.nav.active')?.dataset.mode||validationName}
 function saveSession(){return api('/api/session',{target:$('targetInput').value,mode:currentMode()})}
 function parseVideoMode(){const t=$('fpsMode').value||'';const m=t.match(/(\d+)[×x](\d+).*?(\d+)(?:-\d+)?\s*fps/i);return m?{width:+m[1],height:+m[2],fps:+m[3],high_speed:t.endsWith(' • HS')}:null}
 $('startVideoBtn').onclick=async()=>{try{await saveSession();await postControls();const v=parseVideoMode();if(!v)throw new Error("No video mode selected");if(v.high_speed && $('manualFocus').checked && !confirm("Camera2 high-speed mode may override manual focus. Use standard video to preserve it. Start high-speed video?"))return;await api('/api/video/start',{...v,duration:+$('duration').value,frame_limit:+$('videoFrameLimit').value,target:$('targetInput').value,mode:currentMode(),rank_frames:$('rankFrames').checked})}catch(e){alert(e.message)}};$('stopVideoBtn').onclick=()=>api('/api/video/stop',{}).catch(e=>alert(e.message));
 $('applyBtn').onclick=()=>postControls().catch(alert);$('singleBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/capture',{maximum_jpeg:$('maximumJpeg').checked,raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw',target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value})}catch(e){alert(e.message)}};$('startSeqBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/sequence/start',{target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value,count:+$('count').value,interval_ms:+$('interval').value,calibration:calibrationSelection(),raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw'})}catch(e){alert(e.message)}};$('stopSeqBtn').onclick=()=>api('/api/sequence/stop',{});$('reconnectBtn').onclick=()=>api('/api/reconnect',{});$('manualConnectBtn').onclick=()=>api('/api/manual-connect',{host:$('manualIp').value}).catch(e=>alert(e.message));$('sirilBtn').onclick=()=>api('/api/siril',{calibration:calibrationSelection()}).catch(e=>alert(e.message));
-[...document.querySelectorAll('.nav')].forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('pageTitle').textContent=b.dataset.mode;$('pageHint').textContent=hints[b.dataset.mode]||'';if(b.dataset.mode==='Planetary'){$('profile').value='Jupiter';$('count').value=1000;$('interval').value=0}else if(b.dataset.mode==='Lunar / Solar'){$('profile').value='Moon';$('count').value=100;$('interval').value=50}else if(b.dataset.mode==='Deep Sky'){$('profile').value='Deep Sky';$('count').value=30;$('interval').value=1000}selectWorkflow(b.dataset.mode);if(['Planetary','Lunar / Solar','Deep Sky'].includes(b.dataset.mode))applyProfile();});
+[...document.querySelectorAll('.nav')].forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('pageTitle').textContent=b.dataset.mode;$('pageHint').textContent=hints[b.dataset.mode]||'';if(b.dataset.mode==='Planetary'){$('profile').value='Jupiter';$('count').value=1000;$('interval').value=0}else if(b.dataset.mode==='Lunar / Solar'){$('profile').value='Moon';$('count').value=100;$('interval').value=50}else if(b.dataset.mode===validationName){$('profile').value=validationName;}else if(b.dataset.mode==='Live Stack'){$('profile').value='Live Stack / EAA';}else if(b.dataset.mode==='Deep Sky'){$('profile').value='Deep Sky';$('count').value=30;$('interval').value=1000}selectWorkflow(b.dataset.mode);if([validationName,'Planetary','Lunar / Solar','Deep Sky','Live Stack'].includes(b.dataset.mode))applyProfile();});
 [...document.querySelectorAll('.tab')].forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab-body').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab+'Tab').classList.add('active')});
 $('targetInput').onchange=saveSession;
 function clamp(v,min,max){v=+v;if(Number.isFinite(+min))v=Math.max(v,+min);if(Number.isFinite(+max))v=Math.min(v,+max);return Math.round(v)}
-function applyProfile(){const p=$('profile').value,c=state?.device?.capabilities||{};const preset={Jupiter:{iso:200,exp:5000,roi:'50%',duration:60,count:1000},Saturn:{iso:400,exp:10000,roi:'50%',duration:90,count:1500},Venus:{iso:100,exp:2000,roi:'50%',duration:60,count:1000},Mars:{iso:200,exp:3000,roi:'25%',duration:60,count:1200},Moon:{iso:100,exp:2000,roi:'Full frame',duration:30,count:200},Sun:{iso:50,exp:1000,roi:'Full frame',duration:20,count:200},'Deep Sky':{iso:800,exp:1000000,roi:'Full frame',duration:60,count:30}}[p];$('targetInput').value=p==='Deep Sky'?'M42 Orion Nebula':p;if(preset){
+let profileRequest=0;
+function setDaylightDefaults(c) {
+  $('manualToggle').checked=false;
+  $('manualFocus').checked=false;
+  focusEdited=true;
+  $('iso').value=c.iso_min || 100;
+  $('exposure').value=8333;
+  $('ois').value=c.ois_modes?.includes(1) ? 'on' : 'off';
+  $('eis').value='off';
+  $('fixedColor').checked=false;
+  $('aeLock').checked=false;
+  $('awbLock').checked=false;
+  $('awbMode').value='1';
+  $('roi').selectedIndex=0;
+  $('format').value='jpeg';
+  $('solarWarning').hidden=true;
+  for(const control of document.querySelectorAll('#processingControls select')) control.value='';
+}
+
+async function sendProfile() {
+  if(!state?.device.connected || state.sequence.running || state.video.recording) return;
+  const request=++profileRequest;
+  try {
+    if($('profile').value===validationName) {
+      await api('/api/controls',{...captureProfile(),reset_profile:true});
+      if(request===profileRequest) focusEdited=false;
+    } else await postControls();
+  } catch(e) { if(request===profileRequest) $('footerDetail').textContent=e.message; }
+}
+
+function applyProfile(){const p=$('profile').value,c=state?.device?.capabilities||{};
+if(p===validationName) {
+  setDaylightDefaults(c);
+  $('targetInput').value='Validation';
+  sendProfile();
+  return;
+}
+const preset={Jupiter:{iso:200,exp:5000,roi:'50%',duration:60,count:1000},Saturn:{iso:400,exp:10000,roi:'50%',duration:90,count:1500},Venus:{iso:100,exp:2000,roi:'50%',duration:60,count:1000},Mars:{iso:200,exp:3000,roi:'25%',duration:60,count:1200},Moon:{iso:100,exp:2000,roi:'Full frame',duration:30,count:200},Sun:{iso:50,exp:1000,roi:'Full frame',duration:20,count:200},'Deep Sky':{iso:800,exp:1000000,roi:'Full frame',duration:60,count:30},'Live Stack / EAA':{iso:800,exp:100000,roi:'Full frame',duration:60,count:30}}[p];$('targetInput').value=p==='Deep Sky'?'M42 Orion Nebula':p;if(preset){
   $('iso').value=clamp(['Sun','Moon'].includes(p) ? c.iso_min || preset.iso : preset.iso,c.iso_min,c.iso_max);
   $('exposure').value=clamp(p==='Deep Sky' ? c.exposure_us_max || preset.exp : preset.exp,c.exposure_us_min,c.exposure_us_max);
   if(c.manual_sensor) $('manualToggle').checked=true;
-  if(c.min_focus_distance>0) { $('manualFocus').checked=true; focusEdited=true; }
+  if(c.min_focus_distance>0) { $('manualFocus').checked=true; $('focus').value=0; focusEdited=true; }
+  $('ois').value='off'; $('eis').value='off';
   if(['Jupiter','Saturn','Mars','Venus'].includes(p)) {
     const supported=[...$('fpsMode').options].map(option=>({
       value:option.value, match:option.value.match(/^(\d+)×(\d+) @ (\d+) fps$/)
@@ -133,7 +210,7 @@ function applyProfile(){const p=$('profile').value,c=state?.device?.capabilities
   $('roi').value=preset.roi;$('duration').value=preset.duration;$('count').value=preset.count;$('interval').value=p==='Deep Sky'?1000:0;
 }
 $('solarWarning').hidden=p!=='Sun';
-saveSession()}
+sendProfile()}
 $('profile').onchange=applyProfile;
 [...document.querySelectorAll('[data-overlay]')].forEach(b=>b.onclick=()=>{b.classList.toggle('active');if(b.dataset.overlay==='crosshair')$('crosshair').classList.toggle('show',b.classList.contains('active'));if(b.dataset.overlay==='clip')$('clipOverlay').classList.toggle('show',b.classList.contains('active'))});$('crosshair').classList.add('show');$('clipToggle').onchange=e=>$('clipOverlay').classList.toggle('show',e.target.checked);$('redBtn').onclick=()=>{document.body.classList.toggle('red-mode');$('redBtn').classList.toggle('active')};$('fitBtn').onclick=()=>{$('preview').style.maxWidth='100%';$('preview').style.maxHeight='100%'};$('oneBtn').onclick=()=>{$('preview').style.maxWidth='none';$('preview').style.maxHeight='none'};
 
@@ -207,7 +284,7 @@ $('refreshSessions').onclick = () => loadSessions().catch(e => alert(e.message))
 $('resumeSession').onclick = async () => {
   try {
     await api('/api/sessions/resume', {id:$('savedSessions').value});
-    document.querySelector('[data-mode="Capture"]').click();
+    document.querySelector('[data-mode="Validation / Daylight"]').click();
     document.querySelector('[data-tab="run"]').click();
   } catch(e) { alert(e.message); }
 };
@@ -352,11 +429,27 @@ function renderImaging(s) {
   $('maximumJpegSize').textContent=maximum ? capText('maximum_jpeg_width','maximum_jpeg_height')+' · single still; preview pauses' : '';
   const jpeg=$('maximumJpeg').checked ? capText('maximum_jpeg_width','maximum_jpeg_height') : capText('jpeg_width','jpeg_height');
   const raw=capText('raw_width','raw_height');
-  $('resBadge').textContent='Preview '+capText('preview_width','preview_height');
+  const diag=t.diagnostics || c.diagnostics || {};
+  const actualWidth=diag.preview_width || c.preview_width, actualHeight=diag.preview_height || c.preview_height;
+  $('fpsBadge').textContent=`${n(s.metrics.fps)} FPS received · ${n(displayedFPS)} shown`;
+  $('resBadge').textContent=actualWidth ? `Preview ${actualWidth}×${actualHeight}` : 'Preview —';
+  const exposure=measured.exposure_us == null ? '' : ' · '+formatExposure(measured.exposure_us);
+  const lens=diag.main_rear===true ? 'main rear' : diag.main_rear===false ? 'other rear' : 'physical lens unreported';
+  $('liveDiagnostics').textContent=!s.device.connected ? 'Camera offline' :
+      `${diag.profile_name || 'Camera profile unreported'} · logical ${diag.camera_id || c.camera_id || '—'} / physical ${diag.active_physical_id || '—'} · ${lens} · sensor ${diag.sensor_orientation ?? '—'}° / display ${diag.display_rotation ?? '—'}° / applied ${diag.preview_rotation ?? '—'}° · ${diag.focus || measured.focus_state || 'Focus unreported'}${exposure}`;
+  $('previewQuality').disabled=!s.device.connected || s.sequence.running || s.video.recording || !Array.isArray(c.preview_qualities);
+  if(!qualityPending && diag.preview_quality) $('previewQuality').value=diag.preview_quality;
+  $('validationJpeg').disabled=!s.device.connected || s.sequence.running || s.video.recording || !c.camera_id || validationBusy;
+  $('reviewJpeg').disabled=!s.last_jpeg;
+  if(validationBusy && s.last_jpeg?.received && s.last_jpeg.received!==reviewPrevious && /Validation/.test(s.last_jpeg.processing)) {
+    validationBusy=false;
+    clearTimeout(validationTimer);
+    showJpeg(s.last_jpeg);
+  }
   $('captureBadge').textContent=s.video.recording && s.video.width ? `Video ${s.video.width}×${s.video.height} · ${s.video.fps} FPS` : format==='raw' ? 'DNG '+raw : format==='raw+jpeg' ? `JPEG ${jpeg} + DNG ${raw}` : 'JPEG '+jpeg;
   $('exposureRange').textContent=c.exposure_us_max ? `${c.exposure_us_min}–${c.exposure_us_max} µs` : 'µs';
   $('effectiveExposure').textContent=measured.iso != null && measured.exposure_us != null ?
-      `Measured ISO ${measured.iso} · ${n(measured.exposure_us,2)} µs${measured.active_physical_id==null?'':` · active camera ${measured.active_physical_id}`}` : '';
+      `Measured ISO ${measured.iso} · ${formatExposure(measured.exposure_us)}${measured.active_physical_id==null?'':` · active camera ${measured.active_physical_id}`}` : '';
   $('effectiveStabilization').textContent=[measured.ois==null?'':('OIS '+(measured.ois?'on':'off')),measured.eis==null?'':('EIS '+(measured.eis?'on':'off'))].filter(Boolean).join(' · ');
   const focusSettings=t.focus_settings || c.capture_settings || {};
   if(!focusEdited && typeof focusSettings.manual_focus==='boolean') {
@@ -408,5 +501,42 @@ $('focusInfinity').onclick=()=>moveFocus(0);
 $('telescopeStabilization').onclick=()=>{
   $('ois').value='off';$('eis').value='off';
   api('/api/controls',{ois:false,eis:false}).catch(e=>alert(e.message));
+};
+function formatExposure(us) {
+  const value=Number(us);
+  if(!Number.isFinite(value)||value<=0)return '—';
+  const seconds=value/1e6;
+  const human=seconds >= .25 ? seconds.toFixed(seconds>=1?1:2)+' s' : '1/'+Math.round(1/seconds)+' s';
+  return value.toLocaleString('en-US',{maximumFractionDigits:2})+' µs ('+human+')';
+}
+let qualityPending=false;
+$('previewQuality').onchange=async()=>{
+  qualityPending=true;
+  try {await api('/api/controls',{preview_quality:$('previewQuality').value});}
+  catch(e){$('footerDetail').textContent=e.message;}
+  finally{setTimeout(()=>{qualityPending=false;},900);}
+};
+let validationBusy=false, validationTimer, reviewPrevious;
+function showJpeg(saved) {
+  if(!saved)return;
+  $('jpegReviewTitle').textContent=`${saved.processing} · ${saved.width}×${saved.height} · ${saved.name}`;
+  $('jpegReviewImage').src='/api/last-jpeg?t='+encodeURIComponent(saved.received);
+  if(!$('jpegReviewDialog').open)$('jpegReviewDialog').showModal();
+}
+$('reviewJpeg').onclick=()=>showJpeg(state?.last_jpeg);
+$('closeJpegReview').onclick=()=>$('jpegReviewDialog').close();
+$('validationJpeg').onclick=async()=>{
+  if(validationBusy)return;
+  validationBusy=true;
+  reviewPrevious=state?.last_jpeg?.received;
+  try {
+    await api('/api/session',{target:'Validation',mode:validationName});
+    const max=state.device.capabilities.maximum_jpeg_width > state.device.capabilities.jpeg_width;
+    await api('/api/capture',{validation_jpeg:true,remote_review:true,maximum_jpeg:max,jpeg:true});
+    setDaylightDefaults(state.device.capabilities);
+    $('profile').value=validationName;
+    $('targetInput').value='Validation';
+    validationTimer=setTimeout(()=>{validationBusy=false;},60000);
+  } catch(e){validationBusy=false;alert(e.message);}
 };
 poll();refreshPreview();

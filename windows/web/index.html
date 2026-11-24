@@ -11,7 +11,7 @@
   <aside class="sidebar">
     <div class="brand"><img src="/assets/icon.png"/><div><div class="brand-title"><span>TOD</span> Astro Suite</div><div class="brand-sub">1.0 Engineering RC</div></div></div>
     <nav id="nav">
-      <button class="nav active" data-mode="Capture"><span>◉</span><b>Capture</b></button>
+      <button class="nav active" data-mode="Validation / Daylight"><span>◉</span><b>Validation / Daylight</b></button>
       <button class="nav" data-mode="Planetary"><span>◌</span><b>Planetary</b></button>
       <button class="nav" data-mode="Lunar / Solar"><span>☾</span><b>Lunar / Solar</b></button>
       <button class="nav" data-mode="Deep Sky"><span>✦</span><b>Deep Sky</b></button>
@@ -26,9 +26,9 @@
   </aside>
   <main>
     <header class="topbar">
-      <div><h1 id="pageTitle">Capture</h1><p id="pageHint">Live telescope feed and camera control</p></div>
+      <div><h1 id="pageTitle">Validation / Daylight</h1><p id="pageHint">Camera quality baseline with automatic exposure and focus</p></div>
       <div class="top-actions">
-        <div class="target-box"><span>Target</span><input id="targetInput" value="Jupiter"/></div>
+        <div class="target-box"><span>Target</span><input id="targetInput" value="Validation"/></div>
         <div class="status-pill offline" id="statusPill"><span class="dot"></span><b id="statusText">Offline</b></div>
       </div>
     </header>
@@ -46,6 +46,13 @@
           <button class="tool" id="resetZoom">Reset</button><button class="tool" id="pickFocusPoint" type="button" aria-pressed="false">Pick focus area</button>
           <button class="tool" id="resetFocusPoint" type="button">Center focus</button>
         </div>
+        <div class="zoom-toolbar quality-toolbar">
+          <label for="previewQuality">Preview quality</label>
+          <select id="previewQuality"><option value="LOW">Low latency</option><option value="BALANCED" selected>Balanced</option><option value="HIGH">High quality</option></select>
+          <button class="primary" id="validationJpeg">Validation JPEG</button>
+          <button class="tool" id="reviewJpeg" disabled>Review saved JPEG</button>
+        </div>
+        <output id="liveDiagnostics" class="hint live-diagnostics">Camera offline</output>
         <div class="viewer" id="viewer">
           <img id="preview" alt="Live telescope feed"/>
           <div id="offlineState" class="offline-state"><div class="scope-icon">◉</div><h2>Waiting for TOD Astro Photography</h2><p>Connect the phone with a USB data cable, enable USB debugging, and open TOD Astro Photography.</p><p id="usbHint" role="status"></p><details class="manual-connect"><summary>Manual LAN pairing</summary><input id="manualIp" aria-label="Phone IP" placeholder="Phone IP"/><button id="manualConnectBtn">Connect over LAN</button></details></div>
@@ -66,7 +73,7 @@
         <div class="tabs"><button class="tab active" data-tab="camera">Camera</button><button class="tab" data-tab="run">Capture run</button><button class="tab" data-tab="analysis">Analysis</button></div>
         <div id="cameraTab" class="tab-body active">
           <div class="section-title">Exposure</div>
-          <label class="field"><span>Manual sensor</span><input id="manualToggle" type="checkbox" checked /></label>
+          <label class="field"><span>Manual sensor</span><input id="manualToggle" type="checkbox" /></label>
           <label class="field"><span>ISO <small id="isoRange">capability aware</small></span><input id="iso" type="number" value="200" /></label>
           <label class="field"><span>Exposure <small id="exposureRange">µs</small></span><input id="exposure" type="number" step="any" value="10000" /></label>
           <label class="field"><span>Manual focus</span><input id="manualFocus" type="checkbox"/></label>
@@ -85,7 +92,7 @@
           <label class="field" id="fixedColorRow" hidden><span>Freeze measured white balance</span><input id="fixedColor" type="checkbox"/></label>
           <label class="field"><span>AE lock</span><input id="aeLock" type="checkbox" /></label>
           <label class="field"><span>AWB lock</span><input id="awbLock" type="checkbox" /></label>
-          <label class="field"><span>OIS</span><select id="ois"><option value="off">Off</option><option value="on">On</option></select></label>
+          <label class="field"><span>OIS</span><select id="ois"><option value="off">Off</option><option value="on" selected>On</option></select></label>
           <button class="ghost full" id="telescopeStabilization">Mounted telescope · OIS/EIS off</button>
           <output class="hint" id="effectiveStabilization"></output>
           <div id="processingControls"></div>
@@ -94,7 +101,7 @@
 
         <div id="runTab" class="tab-body">
           <div class="section-title">Target profile</div>
-          <label class="field"><span>Profile</span><select id="profile"><option>Jupiter</option><option>Saturn</option><option>Mars</option><option>Venus</option><option>Moon</option><option>Sun</option><option>Deep Sky</option><option>Custom</option></select></label>
+          <label class="field"><span>Profile</span><select id="profile"><option>Validation / Daylight</option><option>Jupiter</option><option>Saturn</option><option>Mars</option><option>Venus</option><option>Moon</option><option>Sun</option><option>Deep Sky</option><option>Live Stack / EAA</option><option>Custom</option></select></label>
           <p class="hint" id="solarWarning" hidden>A proper telescope solar filter fitted over the front aperture is required before pointing at the Sun.</p>
           <label class="field"><span>Frame type</span><select id="frameType"><option>Light</option><option>Dark</option><option>Flat</option><option>Bias</option></select></label>
           <label class="field"><span>Format</span><select id="format"><option value="jpeg">JPEG</option><option value="raw+jpeg">RAW + JPEG</option><option value="raw">RAW / DNG</option></select></label>
@@ -162,5 +169,9 @@
   </main>
 </div>
 <script src="/assets/app.js"></script>
+<dialog id="jpegReviewDialog">
+  <header><strong id="jpegReviewTitle"></strong><button class="ghost" id="closeJpegReview">Close</button></header>
+  <img id="jpegReviewImage" alt="Saved native JPEG"/>
+</dialog>
 </body>
 </html>

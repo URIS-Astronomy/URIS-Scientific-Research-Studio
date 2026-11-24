@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
-	_ "image/jpeg"
+	"image/jpeg"
 	"io"
 	"io/fs"
 	"log"
@@ -106,7 +106,17 @@ type SessionState struct {
 	SirilPath     string   `json:"siril_path"`
 }
 
+type JPEGReview struct {
+	Name       string    `json:"name"`
+	Width      int       `json:"width"`
+	Height     int       `json:"height"`
+	Processing string    `json:"processing"`
+	Received   time.Time `json:"received"`
+	path       string
+}
+
 type StateSnapshot struct {
+	LastJPEG   *JPEGReview   `json:"last_jpeg,omitempty"`
 	FocusPoint *FocusPoint   `json:"focus_point,omitempty"`
 	App        string        `json:"app"`
 	Version    string        `json:"version"`
@@ -130,6 +140,7 @@ type captureResult struct {
 }
 
 type App struct {
+	lastJPEG         *JPEGReview
 	focusPoint       *FocusPoint
 	active           endpoint
 	phoneID          string
@@ -234,7 +245,7 @@ func (a *App) snapshot() StateSnapshot {
 	if a.stack != nil {
 		stack = a.stack.snapshot()
 	}
-	return StateSnapshot{FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: a.metrics, Video: a.video, Sequence: a.sequence, Session: s}
+	return StateSnapshot{LastJPEG: a.lastJPEG, FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: a.metrics, Video: a.video, Sequence: a.sequence, Session: s}
 }
 func cloneMap(src map[string]any) map[string]any {
 	out := map[string]any{}
@@ -728,6 +739,9 @@ func (a *App) handleEvent(m map[string]any) {
 					err = transferErr
 					break
 				}
+				if strings.EqualFold(filepath.Ext(path), ".jpg") {
+					a.rememberJPEG(path, m)
+				}
 				if stack != nil && strings.EqualFold(filepath.Ext(path), stack.extension) {
 					if stackErr := stack.addFrame(path, int64(exposure)); stackErr != nil {
 						err = stackErr
@@ -737,6 +751,11 @@ func (a *App) handleEvent(m map[string]any) {
 			}
 			if err != nil {
 				a.setError(err)
+			}
+			if diagnostics, ok := m["diagnostics"].(map[string]any); ok {
+				appendSessionLog(sessionDir, map[string]any{"event": "camera_capture", "capture_id": id,
+					"diagnostics": diagnostics, "effective": m["effective"], "jpeg_processing": m["jpeg_processing"],
+					"jpeg_width": m["jpeg_width"], "jpeg_height": m["jpeg_height"]})
 			}
 			a.mu.Lock()
 			delete(a.captureTransfers, id)
@@ -1036,6 +1055,26 @@ func (a *App) fetchFile(target endpoint, path, dir, sessionDir string) (string, 
 	a.mu.Unlock()
 	appendSessionLog(sessionDir, map[string]any{"event": "file_received", "path": final, "size": size, "sha256": hex.EncodeToString(h.Sum(nil)), "time": time.Now().Format(time.RFC3339)})
 	return final, nil
+}
+
+func (a *App) rememberJPEG(path string, metadata map[string]any) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	shape, err := jpeg.DecodeConfig(f)
+	if err != nil {
+		return
+	}
+	processing, _ := metadata["jpeg_processing"].(string)
+	if processing == "" {
+		processing = "Native Camera2 JPEG"
+	}
+	a.mu.Lock()
+	a.lastJPEG = &JPEGReview{Name: filepath.Base(path), Width: shape.Width, Height: shape.Height,
+		Processing: processing, Received: time.Now(), path: path}
+	a.mu.Unlock()
 }
 
 func sanitize(s string) string {
@@ -1465,10 +1504,35 @@ func (a *App) routes() http.Handler {
 		}
 		writeJSON(w, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("GET /api/last-jpeg", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		saved := a.lastJPEG
+		a.mu.RUnlock()
+		if saved == nil {
+			http.NotFound(w, r)
+			return
+		}
+		f, err := os.Open(saved.path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "image/jpeg")
+		http.ServeContent(w, r, saved.Name, saved.Received, f)
+	})
 	mux.HandleFunc("/api/preview.jpg", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
+		etag := strconv.Quote(a.frameETag)
+		if len(a.latestFrame) != 0 && r.Header.Get("If-None-Match") == etag {
+			a.mu.RUnlock()
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		b := append([]byte(nil), a.latestFrame...)
-		etag := a.frameETag
 		a.mu.RUnlock()
 		if len(b) == 0 {
 			http.Error(w, "no frame", http.StatusNoContent)
@@ -1572,9 +1636,11 @@ func (a *App) routes() http.Handler {
 			writeErr(w, err.Error())
 			return
 		}
-		a.mu.Lock()
-		a.currentControls = cloneMap(resp)
-		a.mu.Unlock()
+		if _, ok := resp["manual"].(bool); ok {
+			a.mu.Lock()
+			a.currentControls = cloneMap(resp)
+			a.mu.Unlock()
+		}
 		writeJSON(w, resp)
 	})
 	mux.HandleFunc("/api/capture", func(w http.ResponseWriter, r *http.Request) {
