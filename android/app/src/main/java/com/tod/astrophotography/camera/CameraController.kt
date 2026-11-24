@@ -197,7 +197,7 @@ class CameraController(
     @Volatile private var session: CameraCaptureSession? = null
     private var repeatingBuilder: CaptureRequest.Builder? = null
 
-    private var previewReader: ImageReader? = null
+    @Volatile private var previewReader: ImageReader? = null
     @Volatile private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null
     private var previewSurface: Surface? = null
@@ -1125,7 +1125,8 @@ class CameraController(
             jpegReader?.close()
             jpegReader = ImageReader.newInstance(size.width,size.height,ImageFormat.JPEG,2).apply {
                 setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireNextImage() ?: return@setOnImageAvailableListener
+                    if (reader !== jpegReader || !started) return@setOnImageAvailableListener
+                    val image = runCatching { reader.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
                     try { image.use { if (maximumCapture) saveJpeg(it) } }
                     catch (e: Exception) { failPending("Maximum JPEG save failed: ${e.message}") }
                 },cameraHandler)
@@ -1257,6 +1258,7 @@ class CameraController(
         val configuredQuality = quality
         previewReader = ImageReader.newInstance(previewSize.width, previewSize.height, ImageFormat.YUV_420_888, 3).also { reader ->
             reader.setOnImageAvailableListener({ r ->
+                if (r !== previewReader || !started) return@setOnImageAvailableListener
                 val image = runCatching { r.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
                 try {
                     val now = System.nanoTime()
@@ -1286,7 +1288,8 @@ class CameraController(
 
         jpegReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2).also { reader ->
             reader.setOnImageAvailableListener({ r ->
-                val image = r.acquireNextImage() ?: return@setOnImageAvailableListener
+                if (r !== jpegReader || !started) return@setOnImageAvailableListener
+                val image = runCatching { r.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
                 try { saveJpeg(image) } catch (e: Exception) {
                     failPending("JPEG save failed: ${e.message}")
                 } finally { image.close() }
@@ -1296,7 +1299,8 @@ class CameraController(
         rawReader = if (includeRaw && rawSize != null) {
             ImageReader.newInstance(rawSize!!.width, rawSize!!.height, ImageFormat.RAW_SENSOR, 2).also { reader ->
                 reader.setOnImageAvailableListener({ r ->
-                    val image = r.acquireNextImage() ?: return@setOnImageAvailableListener
+                    if (r !== rawReader || !started) return@setOnImageAvailableListener
+                    val image = runCatching { r.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
                     synchronized(captureLock) {
                         pendingRawImage?.close()
                         pendingRawImage = image
