@@ -1,0 +1,290 @@
+name: 60-minute desktop preview acceptance
+on:
+  push:
+    branches: [tod-release-delivery-v1.0.1-rc.1]
+    paths: [.github/workflows/tod-desktop-soak.yml]
+permissions:
+  contents: read
+
+jobs:
+  desktop-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 88f5386895021cebaa7af8858fc21c9a4ea1ec2f
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare the isolated desktop test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TOD_TEST_ROOT="$RUNNER_TEMP/tod-desktop"
+          mkdir -p "$TOD_TEST_ROOT/profile"
+          npm install --no-save --prefix "$RUNNER_TEMP/tod-playwright" playwright@1.62.1
+          printf '%s' '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAB4AKADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDwuiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAtaalnLqtnHqMrw2LTotxIgyyRlhuI4PIGT0P0rsvidpng/Tb7T18KXEMm+NzcxwXJnjXkbTuJPzH5sjPQDgZyeDooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACu88EfDG68a6He6lDqUNr5MhhhjeMt5jhQ3zEEbV+ZeQGPXjjng6tWupX9jBcQWl7c28NyuyeOKVkWVcEYYA/MME8H1NAFWiiigAooooAKKKKACiiigAooooAKK9G1f4gaNqHwrs/C8OjvHfQrEpkKp5cbIctKpHO5uc8D/WNye/nNABRRRQAUUUUAFFFFABRRRQAUUUUAFT2dpPqF9b2VqnmXFxIsUSZA3MxwBk8Dk96gp8M0ttPHPBI8U0bB0kRirKwOQQR0IPegDovF/gfVvBU9rHqbW0i3Ss0UlvIWUlSNw5AIIyp6Y569cc1Wvr/ijWvFE8M2s373TQqVjBVUVQTk4VQBk8ZOMnA9BWRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFejaRpHgOX4V3l9fXyL4hVZSqm4IkWQH92ix/xKRtycH7zcjHy+c0AFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFejav8QNG1D4V2fheHR3jvoViUyFU8uNkOWlUjnc3OeB/rG5PcA85ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAP/2Q==' | base64 -d > "$TOD_TEST_ROOT/tod-fixture.jpg"
+          cat > "$TOD_TEST_ROOT/run.cjs" <<'NODE_CODE'
+          const {chromium}=require('playwright');
+          const fs=require('node:fs');
+          const path=require('node:path');
+          const work=process.env.TOD_TEST_ROOT;
+          const net=require('node:net');
+          const assert=require('node:assert/strict');
+          const cp=require('node:child_process');
+          const jpeg=fs.readFileSync(path.join(work,'tod-fixture.jpg'));
+          const prefix=Buffer.alloc(4);
+          prefix.writeUInt32BE(jpeg.length);
+          const sockets=new Set(), preview=new Set();
+          const assets=new Map();
+          const sends=[];
+          let app, browser, timer, streaming=true, video=false, holdCapture=false, rotation={rotation:null,flip_x:false,flip_y:false};
+          let next=0, controlState={manual:false,iso:200,exposure_us:8333,manual_focus:false,focus_distance:0,profile_name:'Validation / Daylight'};
+          const caps={
+           camera_id:'0', manual_sensor:true, burst_capture:true, raw_session_available:true, raw_hardware_supported:true, min_focus_distance:10,
+           iso_min:50,iso_max:6400,exposure_us_min:100,exposure_us_max:30000000,display_zoom_max:8,max_zoom:4,
+           preview_width:160,preview_height:120,jpeg_width:160,jpeg_height:120,raw_width:160,raw_height:120,
+           preview_qualities:['LOW','BALANCED','HIGH'],video_modes:['176×144 @ 60 fps','1920×1080 @ 30 fps','3840×2160 @ 24 fps'],
+           awb_modes:[1,5],ae_compensation:{min:-6,max:6,step_ev:0.333},metering_modes:['camera','center','spot'],
+           camera_inventory:[{id:'0',facing:1,openable:true,jpeg_sizes:['160x120'],yuv_sizes:['160x120']}]
+          };
+          const send=(socket,payload)=>{if(!socket.destroyed)socket.write(JSON.stringify(payload)+'\n')};
+          const currentTelemetry=()=>({event:'telemetry',recording:video,effective:{iso:controlState.iso,exposure_us:controlState.exposure_us,
+           ae_compensation:controlState.ae_compensation??0},focus_settings:controlState, diagnostics:{...caps,
+           preview_orientation:rotation,preview_rotation:rotation.rotation??90,preview_quality:'BALANCED',profile_name:controlState.profile_name}});
+          function serve(port,handler) {
+           const server=net.createServer(socket=>{
+             sockets.add(socket);
+             socket.on('close',()=>sockets.delete(socket));
+             socket.on('error',()=>{});
+             handler(socket);
+           });
+           return new Promise((resolve,reject)=>server.on('error',reject).listen(port,'127.0.0.1',()=>resolve(server)));
+          }
+          function ndjson(socket,handler) {
+           let content='';
+           socket.on('data',chunk=>{
+             content+=chunk;
+             let pos;
+             while((pos=content.indexOf('\n'))>=0){const line=content.slice(0,pos);content=content.slice(pos+1);handler(JSON.parse(line));}
+           });
+          }
+          const controlSockets=new Set();
+          const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+          async function startDesktop() {
+           fs.mkdirSync(path.join(work,'profile'),{recursive:true});
+           app=cp.spawn(path.join(work,'tod-linux-integration'),[],{env:{...process.env,USERPROFILE:path.join(work,'profile'),XDG_CONFIG_HOME:path.join(work,'profile','config')},stdio:'inherit'});
+           for(let i=0;i<50;i++){try{if((await fetch('http://127.0.0.1:47871/api/state')).ok)return}catch{}await wait(100);}
+           throw Error('Desktop HTTP server unavailable');
+          }
+          (async()=>{
+           let control, previewServer, files;
+           try {
+             control=await serve(47000,socket=>ndjson(socket,r=>{
+               const p=r.payload||{}, reply={id:r.id,ok:true};
+               sends.push(r);
+               if(r.cmd==='hello'||r.cmd==='probe')Object.assign(reply,{app:'TOD Astro Photography',protocol:2,device_id:'fixture'});
+               if(r.cmd==='hello') {
+                 controlSockets.add(socket);
+                 socket.on('close',()=>controlSockets.delete(socket));
+               }
+               if(r.cmd==='capabilities')Object.assign(reply,caps,{capture_settings:controlState});
+               if(r.cmd==='set_controls') {
+                 if(p.preview_orientation) {rotation=p.preview_orientation;reply.preview_orientation=rotation;}
+                 else {controlState={...controlState,...p};Object.assign(reply,controlState);}
+               }
+               if(r.cmd==='start_video') video=true;
+               if(r.cmd==='stop_video') video=false;
+               send(socket,reply);
+               if(r.cmd==='capture'&&!holdCapture) {
+                 const files=[];
+                 const count=p.burst_count||1;
+                 const stem=++next;
+                 for(let i=0;i<count&&p.jpeg;i++){const name='/captures/'+stem+'-'+i+'.jpg';assets.set(name,jpeg);files.push(name);}
+                 if(p.raw){const name='/captures/'+stem+'.dng';assets.set(name,Buffer.from('simulated raw transfer'));files.push(name);}
+                 send(socket,{event:'capture_saved',capture_id:p.capture_id,files});
+               }
+               if(r.cmd==='start_video')send(socket,{event:'video_started',path:'/captures/simulated.mp4',width:p.width,height:p.height,fps:p.fps});
+               if(r.cmd==='stop_video'){
+                 const name='/captures/simulated.mp4';assets.set(name,Buffer.from('simulated video transfer'));
+                 send(socket,{event:'capture_saved',kind:'video',files:[name]});
+               }
+             }));
+             previewServer=await serve(47001,socket=>{preview.add(socket);socket.on('close',()=>preview.delete(socket));});
+             files=await serve(47002,socket=>ndjson(socket,r=>{
+               const data=assets.get(r.path)||Buffer.alloc(0), length=Buffer.alloc(8);
+               length.writeBigInt64BE(BigInt(data.length));socket.end(Buffer.concat([length,data]));
+             }));
+             timer=setInterval(()=>{
+               if(streaming)for(const socket of preview)if(!socket.destroyed&&!socket.writableNeedDrain)socket.write(Buffer.concat([prefix,jpeg]));
+             },100);
+             const telemetry=setInterval(()=>{for(const socket of controlSockets)send(socket,currentTelemetry());},300);
+             telemetry.unref();
+             await startDesktop();
+             browser=await chromium.launch({executablePath:process.env.TOD_TEST_CHROME,headless:true,args:['--no-sandbox','--disable-dev-shm-usage','--disable-background-timer-throttling','--disable-renderer-backgrounding']});
+             const page=await browser.newPage({acceptDownloads:true});
+             const errors=[];
+             page.on('pageerror',e=>errors.push(e.message));
+             const api=async(path,body)=>{
+               const response=await fetch('http://127.0.0.1:47871'+path,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+               const data=await response.json();assert(response.ok,JSON.stringify(data));return data;
+             };
+             const status=()=>api('/api/state');
+             const until=async(predicate,message)=>{
+               for(let i=0;i<100;i++){if(await predicate())return;await wait(100);}
+               throw Error(message+' '+JSON.stringify(await status()));
+             };
+             await page.goto('http://127.0.0.1:47871/');
+             await api('/api/manual-connect',{host:'127.0.0.1'});
+             await until(async()=>(await status()).metrics.live,'stream failed to connect');
+             await page.locator('#preview.show').waitFor();
+             assert.equal(await page.locator('#fpsMode').inputValue(),'1920×1080 @ 30 fps');
+             console.log('LAN preview, decode, and Full HD default passed');
+             const stateRoute='**/api/state';
+             await page.route(stateRoute, route=>route.abort('failed'));
+             await wait(4500);
+             assert.equal(await page.evaluate(()=>serverOnline),false);
+             assert(await page.locator('#preview').evaluate(el=>el.classList.contains('show')));
+             assert(await page.evaluate(()=>performance.now()-lastDisplayed)<2000);
+             await page.unroute(stateRoute);
+             await until(()=>page.evaluate(()=>serverOnline),'dashboard status did not recover');
+             console.log('Live frames continued during an isolated dashboard status API failure');
+             for(const angle of ['0','90','180','270','auto']){
+               await page.locator('#previewRotation').selectOption(angle);
+               await until(async()=>rotation.rotation===(angle==='auto'?null:Number(angle)),'rotation command missing');
+             }
+             await page.locator('#flipPreviewX').check();
+             await until(async()=>rotation.flip_x,'flip not acknowledged');
+             await page.locator('#flipPreviewY').check();
+             await until(async()=>rotation.flip_y,'vertical flip not acknowledged');
+             streaming=false;
+             await page.locator('#streamNotice').waitFor({state:'visible'});
+             assert.equal(await page.locator('#preview').evaluate(el=>el.classList.contains('show')),false);
+             assert.equal((await status()).metrics.fps,0);
+             streaming=true;
+             await page.locator('#preview.show').waitFor();
+             for(const socket of controlSockets)socket.destroy();
+             await until(async()=>(await status()).metrics.live,'LAN did not recover');
+             console.log('Orientation commands, frame staleness, and reconnect passed');
+             const nav=['Capture','Planetary','Lunar / Solar','Deep Sky','Live Stack','Focus','Sessions','Validation / Daylight'];
+             for(const mode of nav){
+               await page.locator('[data-mode='+JSON.stringify(mode)+']').click();
+               await until(async()=>await page.locator('#pageTitle').textContent()===mode,'navigation failed '+mode);
+             }
+             await page.locator('[data-mode="Capture"]').click();
+             await page.locator('[data-tab="camera"]').count().then(async count=>{if(count)await page.locator('[data-tab="camera"]').click();});
+             const ack=await api('/api/controls',{manual:true,iso:400,exposure_us:20000,manual_focus:true,focus_distance:0,awb_mode:5});
+             assert.equal(ack.iso,400);
+             assert.equal(ack.exposure_us,20000);
+             const capture=async(payload,number)=>{
+               await api('/api/capture',payload);
+               await until(async()=>{
+                 const s=await status();return s.sequence.phase==='completed'&&s.session.captured_files?.length===number;
+               },'transfer not completed');
+             };
+             await capture({jpeg:true},1);
+             await capture({jpeg:true,burst_count:3},4);
+             await capture({jpeg:true,raw:true},6);
+             holdCapture=true;
+             await api('/api/sequence/start',{count:2,jpeg:true});
+             await until(async()=>(await status()).sequence.phase==='capturing','capture did not start');
+             await api('/api/sequence/stop',{});
+             await until(async()=>(await status()).sequence.message==='Stopped','cancel did not finish');
+             assert(sends.some(r=>r.cmd==='cancel_capture'));
+             holdCapture=false;
+             await capture({jpeg:true},1);
+             await api('/api/sequence/start',{count:2,jpeg:true,raw:true,mode:'Deep Sky',target:'M42'});
+             await until(async()=>{
+               const s=await status();return s.sequence.phase==='completed'&&s.sequence.completed===2&&s.session.captured_files?.length===4;
+             },'RAW + JPEG sequence did not transfer four files');
+             await api('/api/video/start',{width:1920,height:1080,fps:30});
+             await until(async()=>(await status()).video.recording,'video did not start');
+             await api('/api/video/stop',{});
+             await until(async()=>{
+               const s=await status();return s.video.message==='Saved'&&s.session.captured_files?.some(file=>file.endsWith('.mp4'));
+             },'video did not stop and transfer');
+             await api('/api/sequence/start',{count:2,jpeg:true,mode:'Live Stack',target:'Star field'});
+             await until(async()=>{const s=await status();return s.sequence.phase==='completed'&&s.stack.accepted>0;},'live stacking did not consume transferred JPEG');
+             assert((await fetch('http://127.0.0.1:47871/api/stack.png')).ok);
+             console.log('All navigation, control acknowledgement, still, burst, sequence transfer, cancel/restart, video events, and stacking passed');
+             const downloadEvent=page.waitForEvent('download');
+             await page.getByRole('link',{name:'Export diagnostics'}).click();
+             const diagnostic=await downloadEvent;
+             assert.equal(diagnostic.suggestedFilename(),'TOD_Astro_Diagnostics.json');
+             assert.equal(errors.length,0,JSON.stringify(errors));
+             await page.locator('#exitDashboard').click();
+             await page.getByRole('button',{name:'Cancel',exact:true}).click();
+             assert((await status()).app);
+             await page.locator('#exitDashboard').click();
+             await page.getByRole('button',{name:'Continue',exact:true}).click();
+             await new Promise((resolve,reject)=>{if(app.exitCode!==null)resolve();else{app.once('exit',resolve);setTimeout(()=>reject(Error('Desktop did not exit')),7000).unref();}});
+             await startDesktop();
+             await page.reload();
+             await page.bringToFront();
+             await page.locator('#preview.show').waitFor();
+             console.log('Diagnostics download, confirmed exit, and reopening passed');
+             const duration=Number(process.env.TOD_INTEGRATION_SOAK_SECONDS || 0);
+             if(duration>0){
+               const start=Date.now();
+               let prior=(await status()).metrics.frames;
+               let reported=0, hiddenSince=0, browserInterruptions=0, staleSince=0, linkInterruptions=0;
+               while(Date.now()-start<1000*duration){
+                 await wait(1000);
+                 const sample=await status(), metrics=sample.metrics;
+                 if (!metrics.live || metrics.frames<=prior) {
+                   if (!staleSince) {
+                     staleSince=Date.now();
+                     linkInterruptions++;
+                     console.log('Preview transport awaiting fresh frames',JSON.stringify({
+                       status:sample.device.status, error:sample.device.last_error, frames:metrics.frames, previous:prior}));
+                   }
+                   assert(Date.now()-staleSince<9000,'preview transport did not recover within nine seconds');
+                 } else staleSince=0;
+                 const visible=await page.locator('#preview').evaluate(el=>el.classList.contains('show'));
+                 if (!visible) {
+                   if (!hiddenSince) {
+                     hiddenSince=Date.now();
+                     browserInterruptions++;
+                     const details=await page.evaluate(()=>({hidden:document.hidden, serverOnline, lastDisplayAge:performance.now()-lastDisplayed,
+                       previewServerLive:state?.metrics.live, previewHasSrc:!!document.getElementById('preview').currentSrc}));
+                     console.log('Browser temporarily waiting for fresh decode',JSON.stringify(details));
+                   }
+                   assert(Date.now()-hiddenSince<9000, 'browser did not recover frame display within nine seconds');
+                 } else hiddenSince=0;
+                 prior=metrics.frames;
+                 const minutes=Math.floor((Date.now()-start)/60000);
+                 if(minutes>reported){console.log('Simulated phone stream sustained '+minutes+' minutes, '+prior+' frames received');reported=minutes;}
+               }
+               console.log('Completed '+duration+' seconds of simulated phone streaming, with '+linkInterruptions+
+                 ' automatically recovered transport interruptions and '+browserInterruptions+' browser display interruptions');
+             }
+           } finally {
+             clearInterval(timer);
+             if(browser)await browser.close();
+             app?.kill();
+             for(const socket of sockets)socket.destroy();
+             control?.close();previewServer?.close();files?.close();
+           }
+          })().catch(error=>{console.error(error);process.exitCode=1});
+          NODE_CODE
+          (cd windows && go build -o "$TOD_TEST_ROOT/tod-linux-integration" .)
+      - name: Run desktop workflow and stream acceptance tests
+        shell: bash
+        run: |
+          export TOD_TEST_ROOT="$RUNNER_TEMP/tod-desktop"
+          export NODE_PATH="$RUNNER_TEMP/tod-playwright/node_modules"
+          export TOD_TEST_CHROME="$(command -v google-chrome || command -v chromium)"
+          export TOD_INTEGRATION_SOAK_SECONDS=3600
+          set -o pipefail
+          node "$TOD_TEST_ROOT/run.cjs" | tee "$TOD_TEST_ROOT/results.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TOD-desktop-acceptance-results
+          path: ${{ runner.temp }}/tod-desktop/results.log
