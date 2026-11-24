@@ -1,0 +1,215 @@
+name: Android emulator acceptance
+on:
+  push:
+    branches: [tod-release-delivery-v1.0.1-rc.1]
+    paths: [.github/workflows/tod-android-acceptance.yml]
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45436211126
+          name: TOD-Astro-Photography-APK
+          path: apk
+      - name: Enable KVM on the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Prepare the Android acceptance test
+        run: |
+          cat > "$RUNNER_TEMP/tod-emulator-smoke.py" <<'PY'
+          import json
+          import socket
+          import struct
+          import subprocess
+          import time
+          
+          
+          def adb(*args):
+              return subprocess.check_output(["adb", *args], text=True).strip()
+          
+          
+          def open_socket(port):
+              return socket.create_connection(("127.0.0.1", port), timeout=8)
+          
+          
+          def ready(port, attempts=30):
+              for _ in range(attempts):
+                  try:
+                      return open_socket(port)
+                  except OSError:
+                      time.sleep(1)
+              raise AssertionError(f"no connection on {port}")
+          
+          
+          class Control:
+              def __init__(self):
+                  self.socket = ready(14700)
+                  self.reader = self.socket.makefile("rb")
+                  self.counter = 0
+          
+              def close(self):
+                  self.reader.close()
+                  self.socket.close()
+          
+              def next(self):
+                  raw = self.reader.readline()
+                  if not raw:
+                      raise AssertionError("camera closed the control socket")
+                  return json.loads(raw)
+          
+              def call(self, name, payload=None, allow_error=False):
+                  self.counter += 1
+                  rid = f"emulator-{self.counter}"
+                  request = {"id": rid, "cmd": name, "payload": payload or {}}
+                  self.socket.sendall(json.dumps(request).encode() + b"\n")
+                  while True:
+                      response = self.next()
+                      if response.get("id") == rid:
+                          assert response.get("ok") or allow_error, response
+                          return response
+          
+              def event(self, name, field, value, timeout=20):
+                  until = time.monotonic() + timeout
+                  while time.monotonic() < until:
+                      data = self.next()
+                      if data.get(field) != value:
+                          continue
+                      assert data.get("event") != "capture_error", data
+                      if data.get("event") == name:
+                          return data
+                  raise AssertionError(f"event {name} for {value} not received")
+          
+          
+          def app_ready():
+              for _ in range(15):
+                  conn = Control()
+                  try:
+                      conn.call("hello", {"client_session": "ci-emulator", "transport": "USB"})
+                      for _ in range(45):
+                          capabilities = conn.call("capabilities", allow_error=True)
+                          if capabilities.get("ok"):
+                              return conn, capabilities
+                          time.sleep(1)
+                  except (OSError, AssertionError):
+                      conn.close()
+                      time.sleep(1)
+                      continue
+                  conn.close()
+                  break
+              raise AssertionError("camera capabilities did not become available")
+          
+          
+          def jpeg_size(image):
+              assert image[:2] == b"\xff\xd8"
+              index = 2
+              while index < len(image) - 7:
+                  assert image[index] == 0xff, "invalid JPEG marker"
+                  marker = image[index + 1]
+                  count = int.from_bytes(image[index + 2:index + 4], "big")
+                  if marker in (0xc0, 0xc1, 0xc2, 0xc3):
+                      height, width = struct.unpack(">HH", image[index + 5:index + 9])
+                      return width, height
+                  assert marker != 0xda and count >= 2, "JPEG dimensions not found"
+                  index += count + 2
+              raise AssertionError("JPEG dimensions not found")
+          
+          
+          def receive(handle, prefix_bytes=4):
+              prefix = handle.read(prefix_bytes)
+              assert len(prefix) == prefix_bytes, "incomplete frame size"
+              length = int.from_bytes(prefix, "big")
+              assert 0 < length < 128 * 1024 * 1024, f"invalid frame size {length}"
+              payload = handle.read(length)
+              assert len(payload) == length, "incomplete frame payload"
+              return payload
+          
+          
+          def read_size(preview, expected=None):
+              for _ in range(25):
+                  shape = jpeg_size(receive(preview))
+                  if expected is None or shape == expected:
+                      return shape
+              raise AssertionError(f"expected frame {expected}, received {shape}")
+          
+          
+          app = "com.tod.astrophotography"
+          for host, phone in ((14700, 47000), (14701, 47001), (14702, 47002)):
+              adb("forward", f"tcp:{host}", f"tcp:{phone}")
+          adb("shell", "am", "start", "-W", "-n", app + "/.MainActivity")
+          control, caps = app_ready()
+          print("Installed and opened Android app; Camera2 ready on emulator:", caps["camera_id"], flush=True)
+          try:
+              with ready(14701) as stream, stream.makefile("rb") as reader:
+                  native = caps["preview_width"], caps["preview_height"]
+                  if caps["diagnostics"]["preview_rotation"] in (90, 270):
+                      native = native[::-1]
+                  assert native[0] != native[1], f"expected non-square preview, got {native}"
+                  for rotation in (0, 90, 180, 270):
+                      setting = {"rotation": rotation, "flip_x": rotation == 180, "flip_y": rotation == 270}
+                      response = control.call("set_controls", {"preview_orientation": setting})
+                      assert response["preview_orientation"] == setting, response
+                      expected = native[::-1] if rotation in (90, 270) else native
+                      read_size(reader, expected)
+                      print("Camera2 preview rotation", rotation, "acknowledged and JPEG decoded", flush=True)
+                  read_size(reader)
+                  with ready(14701) as replacement, replacement.makefile("rb") as reader2:
+                      read_size(reader2)
+                      while stream.recv(1048576):
+                          pass
+                      control.call("ping")
+                      print("Replacement preview socket produces Android camera frames", flush=True)
+          
+              if caps.get("manual_sensor"):
+                  iso = int(caps["iso_min"])
+                  exposure = max(1000, int(caps["exposure_us_min"]))
+                  armed = control.call("set_controls", {"profile": "astronomy", "manual": True, "iso": iso, "exposure_us": exposure})
+                  assert armed["iso"] == iso and armed["manual"], armed
+                  control.call("set_controls", {"manual": False})
+                  print("Camera2 acknowledged a manual ISO and shutter request", flush=True)
+              capture_id = "emulator-jpeg-acceptance"
+              control.call("capture", {"capture_id": capture_id, "jpeg": True, "raw": False})
+              event = control.event("capture_saved", "capture_id", capture_id)
+              assert event["files"] and event["jpeg_width"] and event["jpeg_height"], event
+              with ready(14702) as file_socket, file_socket.makefile("rb") as reader:
+                  file_socket.sendall(json.dumps({"path": event["files"][0]}).encode() + b"\n")
+                  image = receive(reader, prefix_bytes=8)
+                  assert image[-2:] == b"\xff\xd9"
+                  assert jpeg_size(image) == (event["jpeg_width"], event["jpeg_height"])
+                  print("Native emulator JPEG saved and transferred:", jpeg_size(image), len(image), "bytes", flush=True)
+          finally:
+              control.close()
+          
+          adb("shell", "am", "force-stop", app)
+          adb("shell", "am", "start", "-W", "-n", app + "/.MainActivity")
+          control, _ = app_ready()
+          try:
+              with ready(14701) as stream, stream.makefile("rb") as reader:
+                  assert read_size(reader)[0] > 0
+              print("Android application reopened and streamed again", flush=True)
+          finally:
+              control.close()
+          PY
+      - name: Install and test the APK
+        uses: ReactiveCircus/android-emulator-runner@4c44018e59b437e86cdfc41da381398f93ed8808
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back emulated
+          disable-animations: true
+          script: |
+            adb install -g apk/TOD_Astro_Photography.apk
+            python3 "$RUNNER_TEMP/tod-emulator-smoke.py"
+      - name: Report device errors
+        if: failure()
+        run: adb logcat -d -s TODCamera TODNetwork AndroidRuntime
