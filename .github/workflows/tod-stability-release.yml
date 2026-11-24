@@ -1,0 +1,107 @@
+name: Publish TOD Astro Suite 1.0.1 RC 1
+on:
+  push:
+    branches: [tod-release-delivery-v1.0.1-rc.1]
+    paths: [.github/workflows/tod-stability-release.yml]
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: tod-astro-suite-v1.0.1-rc.1
+      APK: TOD_Astro_Photography-v1.0.1-rc.1.apk
+      WINDOWS_ZIP: TOD_Astro_Suite_Windows_x64-v1.0.1-rc.1.zip
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45444845443
+          name: TOD-Astro-Photography-APK
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45444845443
+          name: TOD-Astro-Suite-Windows
+          path: windows
+      - name: Verify both installation packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv release/TOD_Astro_Photography.apk "release/$APK"
+          test -s "release/$APK"
+          unzip -tq "release/$APK"
+          build_tools="$ANDROID_HOME/build-tools"
+          if ! find "$build_tools" -name apksigner -print -quit | grep -q .; then
+            sdkmanager 'build-tools;35.0.0'
+          fi
+          signer="$(find "$build_tools" -name apksigner | sort -V | tail -1)"
+          "$signer" verify --verbose --print-certs "release/$APK"
+          old_url="https://github.com/$GH_REPO/releases/download/tod-astro-suite-rc-1273f79/TOD_Astro_Photography.apk"
+          if curl -fsSL --max-time 30 "$old_url" -o previous.apk; then
+            old_cert=$("$signer" verify --print-certs previous.apk | sed -n 's/.*certificate SHA-256 digest: //p')
+            new_cert=$("$signer" verify --print-certs "release/$APK" | sed -n 's/.*certificate SHA-256 digest: //p')
+            if [[ -n "$old_cert" && -n "$new_cert" && "$old_cert" != "$new_cert" ]]; then
+              echo 'Android signing certificate differs from the previous engineering release.'
+            fi
+          fi
+          "$(dirname "$signer")/aapt" dump badging "release/$APK" > android-badging.txt
+          grep -F "name='com.tod.astrophotography' versionCode='101'" android-badging.txt
+          test -s windows/TOD_Astro_Suite.exe
+          file windows/TOD_Astro_Suite.exe | grep -E 'PE32\+ executable.*x86-64'
+          for member in adb.exe AdbWinApi.dll AdbWinUsbApi.dll NOTICE.txt source.properties; do
+            test -s "windows/platform-tools/$member"
+          done
+          test -s windows/Siril-source.txt
+          find windows/siril -iname siril-cli.exe -size +0c -print -quit | grep -q .
+          (cd windows && zip -q -r "../release/$WINDOWS_ZIP" TOD_Astro_Suite.exe platform-tools siril Siril-source.txt)
+          test -s "release/$WINDOWS_ZIP"
+          unzip -tq "release/$WINDOWS_ZIP"
+          sha256sum "release/$APK" "release/$WINDOWS_ZIP"
+      - name: Publish verified GitHub Release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'NOTES'
+          ## Install
+          
+          - Android. Open `TOD_Astro_Photography-v1.0.1-rc.1.apk` on your phone. This is a debug-signed release candidate. Android requires matching signing certificates for an in-place update. Save any app-local captures before removing an older APK if Android rejects the update.
+          - Windows 11 x64. Extract the entire ZIP and open `TOD_Astro_Suite.exe`. The ZIP carries the USB transport and portable Siril, including the files they need at runtime. LAN operation works without a USB connection.
+          
+          ## Changes
+          
+          - Added automatic and manual preview rotation and independent telescope flips. Focus selection follows preview geometry. JPEG and video carry capture orientation, and RAW sensor pixels and original transfers are preserved.
+          - Replaced queued preview frames with a bounded latest-frame buffer. Added stale-frame detection, automatic reconnect, measured receive FPS and bandwidth, thermal throttling, and a diagnostics download.
+          - Added capture lifecycle and cancellation handling for stills, burst and sequences. Separated phone and desktop activity state and discarded queued camera images on session changes.
+          - Added capability-based camera selection, exposure compensation and metering. Camera2 acknowledgements are displayed alongside measured values where supplied. Video choices include supported variable frame rates and prefer Full HD when available.
+          - Fixed workflow preset and session synchronization. The Windows launcher checks the running dashboard version before reusing its port.
+          
+          ## Test results
+          
+          - Desktop LAN soak with a simulated phone and Chromium. 60 minutes, 35,912 frames, zero transport or browser display interruptions on the GitHub runner. A forced status API failure left the fresh preview visible. Test coverage included preview staleness, reconnection, status, profile synchronization, capture and transfer, video, cancellation and restart, diagnostics, and navigation.
+          - Android API 35 emulator. Installed this APK, checked automatic and manual rotations in all four orientations, acknowledged ISO and shutter settings, saved and transferred a native JPEG and DNG, recorded and transferred H.264 video, cancelled a native JPEG burst and captured again, and confirmed exit and reopen. Sixteen Android unit tests and lint passed.
+          - Windows x64 runner. The built executable served its dashboard and diagnostics and exited successfully. Bundled Siril 1.4.4 registered and stacked six synthetic JPEG light frames into a valid FITS file. A separate Live Stack test recovered a (3, −2) pixel offset, accepted two input frames, and rejected a blank frame.
+          
+          ## Known limits
+          
+          - The Vivo T3 Ultra and a physical Windows 11 USB connection were unavailable for testing. Phone-specific long exposures, thermal endurance, RAW compatibility, and Full HD and 4K recording remain hardware checks. The emulator did not advertise a one-second manual exposure.
+          - Manual white-balance temperature and tint are unavailable in this release. Supported Camera2 white-balance presets and measured white-balance locking remain available where advertised.
+          - Constrained high-speed recording uses the phone's live preview and may override manual camera controls.
+          
+          [Build and Windows checks](https://github.com/URIS-Astronomy/URIS-Scientific-Research-Studio/actions/runs/45444845443) · [Android emulator checks](https://github.com/URIS-Astronomy/URIS-Scientific-Research-Studio/actions/runs/45446294402) · [60-minute desktop soak](https://github.com/URIS-Astronomy/URIS-Scientific-Research-Studio/actions/runs/45445123179)
+          NOTES
+          if existing=$(gh release view "$TAG" --json isDraft,targetCommitish 2>/dev/null); then
+            jq -e '.isDraft and .targetCommitish == "88f5386895021cebaa7af8858fc21c9a4ea1ec2f"' <<< "$existing"
+          else
+            gh release create "$TAG" --target 88f5386895021cebaa7af8858fc21c9a4ea1ec2f --title 'TOD Astro Suite 1.0.1 Stability RC 1' --prerelease --draft --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" "release/$APK" "release/$WINDOWS_ZIP" --clobber
+          gh release view "$TAG" --json assets --jq '.assets[] | [.name, .size] | @tsv'
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json url,assets
