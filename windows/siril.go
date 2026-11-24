@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -170,8 +171,13 @@ func runSiril(executable, root, session string, calibrators map[string]string) e
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
 	defer cancel()
 	command := exec.CommandContext(ctx, executable, "-d", job, "-s", script)
-	command.Stdout, command.Stderr = log, log
-	if err = command.Run(); err != nil {
+	// Keep the session log handle in this process. Siril can launch helpers
+	// that outlive its CLI and otherwise inherit and lock the file on Windows.
+	writer := io.MultiWriter(log)
+	command.Stdout, command.Stderr = writer, writer
+	command.WaitDelay = 2 * time.Second
+	hideConsole(command)
+	if err = command.Run(); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
 		return fmt.Errorf("Siril: %w. Log: %s", err, logName)
 	}
 	files, _ := filepath.Glob(filepath.Join(job, "work", "TOD_Stacked.*"))
