@@ -15,7 +15,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: 45436211126
+          run-id: 45437731374
           name: TOD-Astro-Photography-APK
           path: apk
       - name: Enable KVM on the runner
@@ -26,7 +26,9 @@ jobs:
       - name: Prepare the Android acceptance test
         run: |
           cat > "$RUNNER_TEMP/tod-emulator-smoke.py" <<'PY'
+          import collections
           import json
+          import re
           import socket
           import struct
           import subprocess
@@ -55,6 +57,7 @@ jobs:
                   self.socket = ready(14700)
                   self.reader = self.socket.makefile("rb")
                   self.counter = 0
+                  self.events = collections.deque(maxlen=128)
           
               def close(self):
                   self.reader.close()
@@ -76,11 +79,13 @@ jobs:
                       if response.get("id") == rid:
                           assert response.get("ok") or allow_error, response
                           return response
+                      if response.get("event") not in (None, "telemetry"):
+                          self.events.append(response)
           
               def event(self, name, field, value, timeout=20):
                   until = time.monotonic() + timeout
                   while time.monotonic() < until:
-                      data = self.next()
+                      data = self.events.popleft() if self.events else self.next()
                       if data.get(field) != value:
                           continue
                       assert data.get("event") != "capture_error", data
@@ -160,7 +165,25 @@ jobs:
                       expected = native[::-1] if rotation in (90, 270) else native
                       read_size(reader, expected)
                       print("Camera2 preview rotation", rotation, "acknowledged and JPEG decoded", flush=True)
-                  read_size(reader)
+                  control.call("set_controls", {"preview_orientation": {"rotation": None, "flip_x": False, "flip_y": False}})
+                  adb("shell", "wm", "fixed-to-user-rotation", "enabled")
+                  try:
+                      for index in range(4):
+                          degrees = index * 90
+                          adb("shell", "wm", "user-rotation", "lock", str(index))
+                          for _ in range(30):
+                              info = control.call("telemetry")["diagnostics"]
+                              if info["display_rotation"] == degrees:
+                                  break
+                              time.sleep(.2)
+                          assert info["display_rotation"] == degrees, info
+                          assert info["preview_rotation"] == (info["sensor_orientation"] - degrees) % 360, info
+                          shape = native[::-1] if info["preview_rotation"] in (90, 270) else native
+                          read_size(reader, shape)
+                          print("Auto orientation followed emulator display rotation", degrees, flush=True)
+                  finally:
+                      adb("shell", "wm", "user-rotation", "free")
+                      adb("shell", "wm", "fixed-to-user-rotation", "default")
                   with ready(14701) as replacement, replacement.makefile("rb") as reader2:
                       read_size(reader2)
                       while stream.recv(1048576):
@@ -185,6 +208,48 @@ jobs:
                   assert image[-2:] == b"\xff\xd9"
                   assert jpeg_size(image) == (event["jpeg_width"], event["jpeg_height"])
                   print("Native emulator JPEG saved and transferred:", jpeg_size(image), len(image), "bytes", flush=True)
+              if caps.get("burst_capture"):
+                  burst = "emulator-burst-acceptance"
+                  control.call("capture", {"capture_id": burst, "jpeg": True, "burst_count": 3})
+                  burst_event = control.event("capture_saved", "capture_id", burst)
+                  assert len(burst_event["files"]) == 3, burst_event
+                  print("Native emulator JPEG burst saved three frames", flush=True)
+              else:
+                  print("Emulator camera does not advertise native JPEG burst", flush=True)
+          
+              if caps.get("raw_session_available"):
+                  raw_id = "emulator-raw-jpeg-acceptance"
+                  control.call("capture", {"capture_id": raw_id, "jpeg": True, "raw": True})
+                  raw_event = control.event("capture_saved", "capture_id", raw_id)
+                  raw_path = next(path for path in raw_event["files"] if path.endswith(".dng"))
+                  assert any(path.endswith(".jpg") for path in raw_event["files"]), raw_event
+                  with ready(14702) as file_socket, file_socket.makefile("rb") as reader:
+                      file_socket.sendall(json.dumps({"path": raw_path}).encode() + b"\n")
+                      dng = receive(reader, prefix_bytes=8)
+                      assert dng[:4] in (b"II*\x00", b"MM\x00*"), dng[:4]
+                  print("Native emulator RAW + JPEG captured and the original DNG transferred", flush=True)
+              else:
+                  print("Emulator camera did not expose a usable RAW session", flush=True)
+          
+              video_modes = [re.fullmatch(r"(\d+)×(\d+) @ (\d+)(?:-(\d+))? fps", mode) for mode in caps.get("video_modes", [])]
+              video_modes = [match for match in video_modes if match]
+              if video_modes:
+                  modest_modes = [match for match in video_modes if 640 <= int(match[1]) <= 1280]
+                  mode = min(modest_modes or video_modes, key=lambda match: int(match[1]) * int(match[2]))
+                  width, height, fps = int(mode[1]), int(mode[2]), int(mode[4] or mode[3])
+                  control.call("start_video", {"width": width, "height": height, "fps": fps})
+                  started = control.event("video_started", "width", width)
+                  assert started["height"] == height and started["fps"] == fps, started
+                  time.sleep(1.5)
+                  control.call("stop_video")
+                  video_event = control.event("capture_saved", "kind", "video")
+                  with ready(14702) as file_socket, file_socket.makefile("rb") as reader:
+                      file_socket.sendall(json.dumps({"path": video_event["files"][0]}).encode() + b"\n")
+                      mp4 = receive(reader, prefix_bytes=8)
+                      assert len(mp4) > 1024 and mp4[4:8] == b"ftyp"
+                  print("Native emulator H.264 recording started, stopped, and transferred:", width, height, fps, len(mp4), flush=True)
+              else:
+                  print("Emulator camera did not advertise standard video mode", flush=True)
           finally:
               control.close()
           
