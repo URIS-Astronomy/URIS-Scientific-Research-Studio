@@ -11,6 +11,8 @@ TOD Astro Photography uses Android Camera2. TOD Astro Suite is the Windows x64 i
 
 The Windows download includes the USB support binaries in the adjacent `platform-tools` folder. Extract the entire download before opening the EXE. Windows must be able to enumerate the phone's USB data and debugger interfaces. A charging-only cable or port that never establishes data can be indistinguishable from a disconnected phone. The dashboard uses Android’s USB power report when a LAN connection is available.
 
+For a terrestrial quality check, start in **Validation / Daylight** and use **Validation JPEG**. Tap the phone preview to focus, or use the center Focus button. **Review** opens the saved still at its native resolution with a fitted screen view. Preview quality can be changed without changing the requested still resolution. A native stock-camera comparison requires the same handset, lens, framing and lighting.
+
 USB has priority. When it is unavailable, the app tries LAN discovery, then the last working LAN address, then the optional manual LAN pairing address. An active LAN session upgrades to USB between exposures or after recording. If USB drops, the app tries USB again and can fall back to the same phone over LAN. Sequence requests keep their original capture ID during recovery.
 
 Windows opens the dashboard in an Edge app window or the Windows default browser. The Android APK uses debug signing and the Windows executable is unsigned.
