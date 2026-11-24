@@ -219,7 +219,7 @@ function renderWorkflow(s) {
   $('sirilBtn').disabled = !s.session.siril_path || s.session.siril_status === 'Processing' || s.session.captured_files?.length === 0;
   $('sirilBtn').title = 'Requires Siril CLI and captured light frames';
   const report = s.video.review;
-  $('videoReview').textContent = report ? `${report.camera_frames_started} Camera2 starts · ${report.encoded_frames} encoded · ${report.cadence_gaps} missing cadence slots · ${report.camera_failures} Camera2 loss events${report.scored_frames ? ` · ${report.scored_frames} scored, ${report.best_frames.length} selected` : ''}` : s.video.recording ? `${s.video.camera_frames} Camera2 starts · ${s.video.camera_failures} loss events` : '';
+  $('videoReview').textContent = report ? `${report.camera_frames_started} Camera2 starts · ${report.encoded_frames} encoded · ${report.encoder_missing_frames == null ? "encoder matching unavailable" : report.encoder_missing_frames + " unmatched encoder frames"} · ${report.cadence_gaps} missing cadence slots · ${report.camera_failures} Camera2 loss events${report.scored_frames ? ` · ${report.scored_frames} scored, ${report.best_frames.length} selected` : ''}` : s.video.recording ? `${s.video.camera_frames} Camera2 starts · ${s.video.camera_failures} loss events` : '';
   renderSessionSelection();
 }
 

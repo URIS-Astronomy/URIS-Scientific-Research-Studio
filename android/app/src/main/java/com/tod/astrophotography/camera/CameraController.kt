@@ -15,7 +15,7 @@ import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.DngCreator
 import android.media.Image
 import android.media.ImageReader
-import android.media.MediaRecorder
+import android.media.MediaCodec
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
@@ -63,12 +63,14 @@ class CameraController(
     private var hardwareRawSupported = false
     @Volatile private var rawSessionAvailable = false
     @Volatile private var started = false
-    @Volatile private var mediaRecorder: MediaRecorder? = null
+    @Volatile private var videoEncoder: SurfaceVideoEncoder? = null
     private var recordingFile: File? = null
     private var recordingTimer: Runnable? = null
     private var videoFPS = 0
     private var videoFailures = 0
     private var videoFrames = 0L
+    private var videoCameraTimes = FrameTimes()
+    private var videoLostFrames = mutableSetOf<Long>()
     private var videoRank = false
     private val videoReview = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Volatile private var recording = false
@@ -126,10 +128,10 @@ class CameraController(
         cameraHandler.post {
             recordingTimer?.let(cameraHandler::removeCallbacks)
             recordingTimer = null
-            if (recording || mediaRecorder != null) {
-                try { mediaRecorder?.stop() } catch (_: Exception) {}
-                try { mediaRecorder?.release() } catch (_: Exception) {}
-                mediaRecorder = null
+            if (recording || videoEncoder != null) {
+                try { videoEncoder?.stop() } catch (_: Exception) {}
+                try { videoEncoder?.release() } catch (_: Exception) {}
+                videoEncoder = null
                 recordingFile = null
                 recording = false
             }
@@ -184,10 +186,10 @@ class CameraController(
         if (map != null) {
             try {
                 val ranges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
-                map.getOutputSizes(MediaRecorder::class.java)?.sortedByDescending { it.width.toLong() * it.height }?.filter { it.width <= 3840 && it.height <= 2160 }?.take(12)?.forEach { size ->
-                    val minDuration = map.getOutputMinFrameDuration(MediaRecorder::class.java, size)
+                map.getOutputSizes(MediaCodec::class.java)?.sortedByDescending { it.width.toLong() * it.height }?.filter { it.width <= 3840 && it.height <= 2160 }?.take(12)?.forEach { size ->
+                    val minDuration = map.getOutputMinFrameDuration(MediaCodec::class.java, size)
                     ranges.filter { it.lower == it.upper && it.upper <= 60 &&
-                        (minDuration == 0L || minDuration * it.upper <= 1_001_000_000L) }.distinct().forEach {
+                        (minDuration == 0L || minDuration * it.upper <= 1_001_000_000L) && avcEncoder(size.width,size.height,it.upper) != null }.distinct().forEach {
                         videoModes.put("${size.width}×${size.height} @ ${it.upper} fps")
                     }
                 }
@@ -197,7 +199,7 @@ class CameraController(
         if (highSpeed && map != null) {
             try {
                 map.highSpeedVideoSizes.forEach { size ->
-                    map.getHighSpeedVideoFpsRangesFor(size).filter { it.lower == it.upper }.forEach { range ->
+                    map.getHighSpeedVideoFpsRangesFor(size).filter { it.lower == it.upper && avcEncoder(size.width,size.height,it.upper) != null }.forEach { range ->
                         highSpeedModes.put("${size.width}×${size.height} @ ${range.lower}-${range.upper} fps")
                     }
                 }
@@ -229,7 +231,7 @@ class CameraController(
             .put("burst_capture", burst)
             .put("high_speed_video", highSpeed)
             .put("high_speed_modes", highSpeedModes)
-            .put("video_capture", videoModes.length() > 0)
+            .put("video_capture", videoModes.length() > 0 || highSpeedModes.length() > 0)
             .put("video_modes", videoModes)
             .put("hardware_level", hwLevel)
             .put("physical_camera_ids", physicalIds)
@@ -298,7 +300,12 @@ class CameraController(
     fun isRecording(): Boolean = recording
 
     fun capture(payload: JSONObject): JSONObject {
-        if (recording || mediaRecorder != null) return JSONObject().put("ok", false).put("error", "Video recording is active")
+        val captureId = payload.optString("capture_id")
+        if (captureId.isNotEmpty() && !captureId.matches(Regex("[A-Za-z0-9_-]{1,80}"))) {
+            return JSONObject().put("ok", false).put("error", "Invalid capture ID")
+        }
+
+        if (recording || videoEncoder != null) return JSONObject().put("ok", false).put("error", "Video recording is active")
         if (cameraDevice == null || session == null || jpegReader == null) {
             return JSONObject().put("ok", false).put("error", "Camera not ready")
         }
@@ -314,17 +321,27 @@ class CameraController(
         }
         synchronized(captureLock) {
             if (pendingCapture != null) {
+                if (captureId.isNotEmpty() && pendingCapture?.captureId == captureId) {
+                    return JSONObject().put("ok", true).put("status", "capture_in_progress")
+                }
                 return JSONObject().put("ok", false).put("error", "A capture is already in progress")
             }
+            if (captureId.isNotEmpty()) {
+                val saved = runCatching { JSONObject(receiptFile(captureId).readFully().toString(Charsets.UTF_8)) }.getOrNull()
+                if (saved != null) {
+                    eventSink(saved)
+                    return JSONObject().put("ok", true).put("status", "capture_replayed")
+                }
+            }
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            pendingCapture = PendingCapture("TOD_$stamp", wantsRaw, payload.optString("capture_id"), payload.optString("frame_type", "Light"), count, jpegDone = !wantsJpeg, rawDone = !wantsRaw)
+            pendingCapture = PendingCapture(if (captureId.isEmpty()) "TOD_$stamp" else "TOD_$captureId", wantsRaw, captureId, payload.optString("frame_type", "Light"), count, jpegDone = !wantsJpeg, rawDone = !wantsRaw)
         }
         cameraHandler.post { performStillCapture(wantsRaw, wantsJpeg, count) }
         return JSONObject().put("ok", true).put("status", "capture_started").put("raw", wantsRaw)
     }
 
     fun startVideo(payload: JSONObject): JSONObject {
-        if (recording || mediaRecorder != null) return JSONObject().put("ok", false).put("error", "Video is already recording or starting")
+        if (recording || videoEncoder != null) return JSONObject().put("ok", false).put("error", "Video is already recording or starting")
         if (cameraDevice == null) return JSONObject().put("ok", false).put("error", "Camera not ready")
         val width = payload.optInt("width", 1920).coerceAtLeast(320)
         val height = payload.optInt("height", 1080).coerceAtLeast(240)
@@ -336,8 +353,8 @@ class CameraController(
             try {
                 configureRecording(width, height, fps, bitrate, highSpeed, durationMs, payload.optBoolean("rank_frames"), payload.optLong("frame_limit").coerceIn(0, 2_000_000))
             } catch (e: Exception) {
-                mediaRecorder?.release()
-                mediaRecorder = null
+                videoEncoder?.release()
+                videoEncoder = null
                 recordingFile?.delete()
                 recordingFile = null
                 recording = false
@@ -349,7 +366,7 @@ class CameraController(
     }
 
     fun stopVideo(): JSONObject {
-        if (!recording && mediaRecorder == null) return JSONObject().put("ok", false).put("error", "Video is not recording")
+        if (!recording && videoEncoder == null) return JSONObject().put("ok", false).put("error", "Video is not recording")
         cameraHandler.post { stopRecordingInternal() }
         return JSONObject().put("ok", true).put("status", "video_stopping")
     }
@@ -358,7 +375,7 @@ class CameraController(
         val camera = cameraDevice ?: return
         val chars = characteristics ?: return
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
-        check(!recording && mediaRecorder == null) { "Video is already starting or recording" }
+        check(!recording && videoEncoder == null) { "Video is already starting or recording" }
         check(synchronized(captureLock) { pendingCapture == null }) { "A still capture is in progress" }
         val size = Size(requestedWidth, requestedHeight)
         val fps = requestedFps
@@ -367,9 +384,9 @@ class CameraController(
             require(map.highSpeedVideoSizes.contains(size) &&
                 map.getHighSpeedVideoFpsRangesFor(size).contains(range)) { "Unsupported high-speed video mode" }
         } else {
-            require(map.getOutputSizes(MediaRecorder::class.java)?.contains(size) == true &&
+            require(map.getOutputSizes(MediaCodec::class.java)?.contains(size) == true &&
                 chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.contains(range) == true &&
-                fps <= 60 && map.getOutputMinFrameDuration(MediaRecorder::class.java, size) * fps <= 1_001_000_000L) {
+                fps <= 60 && map.getOutputMinFrameDuration(MediaCodec::class.java, size) * fps <= 1_001_000_000L) {
                 "Unsupported video resolution or FPS"
             }
         }
@@ -378,22 +395,12 @@ class CameraController(
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { session?.close() } catch (_: Exception) {}
         session = null
-        try { mediaRecorder?.release() } catch (_: Exception) {}
+        try { videoEncoder?.release() } catch (_: Exception) {}
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val out = File(captureDir(), "TOD_VIDEO_$stamp.mp4")
-        val recorder = MediaRecorder()
-        mediaRecorder = recorder
+        val recorder = SurfaceVideoEncoder(out, size.width, size.height, fps, bitrate)
+        videoEncoder = recorder
         recordingFile = out
-        recorder.apply {
-            setVideoSource(MediaRecorder.VideoSource.SURFACE)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setOutputFile(out.absolutePath)
-            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            setVideoEncodingBitRate(bitrate.coerceIn(1_000_000, 160_000_000))
-            setVideoFrameRate(fps)
-            setVideoSize(size.width, size.height)
-            prepare()
-        }
         val texture = textureView.surfaceTexture ?: throw IllegalStateException("Preview surface is not ready")
         if (highSpeed) texture.setDefaultBufferSize(size.width, size.height)
         else texture.setDefaultBufferSize(previewSize.width, previewSize.height)
@@ -406,11 +413,15 @@ class CameraController(
         videoFPS = fps
         videoFailures = 0
         videoFrames = 0
+        val cameraTimes = FrameTimes()
+        videoCameraTimes = cameraTimes
+        val lost = mutableSetOf<Long>()
+        videoLostFrames = lost
         videoRank = rankFrames
         var lastReport = 0L
         val counters = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
-                if (!recording || mediaRecorder !== recorder) return
+                if (!recording || videoEncoder !== recorder) return
                 videoFrames++
                 if (timestamp - lastReport >= 1_000_000_000L) {
                     lastReport = timestamp
@@ -418,21 +429,30 @@ class CameraController(
                         .put("camera_frames_started", videoFrames).put("camera_failures", videoFailures))
                 }
                 if (frameLimit > 0L && videoFrames == frameLimit) {
-                    cameraHandler.post { if (mediaRecorder === recorder) stopRecordingInternal() }
+                    cameraHandler.post { if (videoEncoder === recorder) stopRecordingInternal() }
                 }
             }
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                if (!recording || videoEncoder !== recorder) return
+                result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP)?.let {
+                    cameraTimes.add(it / 1000, result.frameNumber)
+                }
+            }
+
             override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
-                if (recording && mediaRecorder === recorder) videoFailures++
+                if (recording && videoEncoder === recorder) videoFailures++
             }
             override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
-                if (target == encoderSurface && recording && mediaRecorder === recorder) videoFailures++
+                if (target == encoderSurface && recording && videoEncoder === recorder) {
+                    if (lost.add(frameNumber)) videoFailures++
+                }
             }
         }
 
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(captureSession: CameraCaptureSession) {
                 try {
-                    if (!started || mediaRecorder !== recorder) {
+                    if (!started || videoEncoder !== recorder) {
                         captureSession.close()
                         return
                     }
@@ -452,7 +472,7 @@ class CameraController(
                     recorder.start()
                     recording = true
                     if (durationMs > 0) {
-                        val timer = Runnable { if (mediaRecorder === recorder) stopRecordingInternal() }
+                        val timer = Runnable { if (videoEncoder === recorder) stopRecordingInternal() }
                         recordingTimer = timer
                         cameraHandler.postDelayed(timer, durationMs)
                     }
@@ -461,7 +481,7 @@ class CameraController(
                 } catch (e: Exception) {
                     eventSink(JSONObject().put("event", "capture_error").put("message", "Video start failed: ${e.message}"))
                     try { recorder.release() } catch (_: Exception) {}
-                    mediaRecorder = null
+                    videoEncoder = null
                     recordingFile = null
                     recording = false
                     configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
@@ -471,7 +491,7 @@ class CameraController(
                 captureSession.close()
                 eventSink(JSONObject().put("event", "capture_error").put("message", "Video session configuration failed"))
                 try { recorder.release() } catch (_: Exception) {}
-                mediaRecorder = null
+                videoEncoder = null
                 recordingFile = null
                 recording = false
                 configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
@@ -484,17 +504,16 @@ class CameraController(
     private fun stopRecordingInternal() {
         recordingTimer?.let(cameraHandler::removeCallbacks)
         recordingTimer = null
-        val recorder = mediaRecorder
+        val recorder = videoEncoder
         val file = recordingFile
         try { session?.stopRepeating() } catch (_: Exception) {}
         try { session?.abortCaptures() } catch (_: Exception) {}
         var ok = false
         if (recorder != null) {
             try { recorder.stop(); ok = true } catch (_: Exception) {}
-            try { recorder.reset() } catch (_: Exception) {}
             try { recorder.release() } catch (_: Exception) {}
         }
-        mediaRecorder = null
+        videoEncoder = null
         recordingFile = null
         recording = false
         if (ok && file != null && file.isFile && file.length() > 0) {
@@ -503,10 +522,15 @@ class CameraController(
             val failures = videoFailures
             val rank = videoRank
             val frames = videoFrames
+            val cameraTimes = videoCameraTimes
+            val encoderTimes = recorder?.frameTimes
+            val missing = if (encoderTimes?.complete == true && cameraTimes.complete)
+                missingEncoderFrames(cameraTimes.sorted(videoLostFrames), encoderTimes.sorted()) else null
             if (started && !videoReview.isShutdown) runCatching {
                 videoReview.execute {
                     try {
                         val report = reviewVideo(file, fps, failures, frames, rank)
+                        if (missing != null) report.put("encoder_missing_frames", missing)
                         if (!Thread.currentThread().isInterrupted) {
                             report.put("event", "video_review").put("path", file.absolutePath)
                             eventSink(report)
@@ -589,7 +613,7 @@ class CameraController(
     private fun recoverCamera(message: String) {
         statusSink("$message • retrying")
         if (synchronized(captureLock) { pendingCapture != null }) failPending(message)
-        if (recording || mediaRecorder != null) stopRecordingInternal()
+        if (recording || videoEncoder != null) stopRecordingInternal()
         session?.close()
         session = null
         repeatingBuilder = null
@@ -838,17 +862,38 @@ class CameraController(
     private fun maybeEmitCaptureComplete() {
         val done: PendingCapture? = synchronized(captureLock) {
             val p = pendingCapture
-            if (p != null && p.jpegDone && p.rawDone) {
-                pendingCapture = null
-                p
-            } else null
+            if (p != null && p.jpegDone && p.rawDone) p else null
         }
         if (done != null) {
             val files = JSONArray()
             done.burstFiles.forEach(files::put)
             done.rawPath?.let(files::put)
-            eventSink(JSONObject().put("event", "capture_saved").put("files", files).put("raw_requested", done.wantsRaw).put("capture_id", done.captureId).put("frame_type", done.frameType))
+            val event = JSONObject().put("event", "capture_saved").put("files", files)
+                .put("raw_requested", done.wantsRaw).put("capture_id", done.captureId).put("frame_type", done.frameType)
+            if (done.captureId.isNotEmpty()) {
+                try {
+                    val receipt = receiptFile(done.captureId)
+                    val output = receipt.startWrite()
+                    try {
+                        output.write(event.toString().toByteArray(Charsets.UTF_8))
+                        receipt.finishWrite(output)
+                    } catch (e: Exception) {
+                        receipt.failWrite(output)
+                        throw e
+                    }
+                } catch (e: Exception) {
+                    failPending("Capture receipt failed: ${e.message}")
+                    return
+                }
+            }
+            synchronized(captureLock) { if (pendingCapture === done) pendingCapture = null }
+            eventSink(event)
         }
+    }
+
+    private fun receiptFile(id: String): android.util.AtomicFile {
+        val directory = File(activity.filesDir, "capture-receipts")
+        return android.util.AtomicFile(File(directory, "$id.json"))
     }
 
     private fun failPending(message: String) {

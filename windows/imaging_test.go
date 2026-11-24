@@ -112,6 +112,7 @@ func TestInterruptedJournalRestoresProgress(t *testing.T) {
 		Target: "M42", Mode: "Deep Sky", FrameType: "Light", Requested: 3, Completed: 1, Running: true, IntegrationUS: 500000,
 	}})
 	appendSessionLog(dir, map[string]any{"event": "file_received", "path": "one.jpg"})
+	appendSessionLog(dir, map[string]any{"event": "capture_requested", "capture_id": "attempt-2", "exposure_index": 1})
 	f, err := os.OpenFile(filepath.Join(dir, "session.jsonl"), os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +121,7 @@ func TestInterruptedJournalRestoresProgress(t *testing.T) {
 	_ = f.Close()
 	list := sessionIndex(root)
 	if len(list) != 1 || list[0].State.Running || list[0].State.Message != "Interrupted" || list[0].State.Completed != 1 ||
-		list[0].State.IntegrationUS != 500000 || list[0].Controls["iso"] != 400.0 || list[0].Files != 1 {
+		list[0].State.IntegrationUS != 500000 || list[0].Controls["iso"] != 400.0 || list[0].Files != 1 || list[0].PendingID != "attempt-2" || list[0].PendingIndex != 1 {
 		t.Fatalf("incorrect recovery: %+v", list)
 	}
 	if _, ok := sessionPath(root, "../Pictures/file"); ok {

@@ -800,6 +800,21 @@ func (a *App) fetchFile(host, path, dir, sessionDir string) (string, error) {
 		return "", closeErr
 	}
 	final := filepath.Join(dir, name)
+	if existing, statErr := os.Stat(final); statErr == nil && existing.Size() == size {
+		previous, openErr := os.Open(final)
+		if openErr != nil {
+			return "", openErr
+		}
+		oldHash := sha256.New()
+		_, hashErr := io.Copy(oldHash, previous)
+		_ = previous.Close()
+		if hashErr != nil {
+			return "", hashErr
+		}
+		if bytes.Equal(oldHash.Sum(nil), h.Sum(nil)) {
+			return final, nil
+		}
+	}
 	if err := os.Rename(f.Name(), final); err != nil {
 		return "", err
 	}
@@ -1031,6 +1046,10 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 				a.mu.Unlock()
 			}
 			id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)
+			if resume != nil && resume.PendingIndex == i && resume.PendingID != "" {
+				id = resume.PendingID
+			}
+			appendSessionLog(dir, map[string]any{"event": "capture_requested", "capture_id": id, "exposure_index": i})
 			a.mu.Lock()
 			select {
 			case <-a.captureDone:

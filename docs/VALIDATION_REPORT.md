@@ -1,6 +1,6 @@
 # Engineering RC validation
 
-The Android workflow compiles and lints the APK. Its Gradle unit-test task currently has no test sources. The Windows workflow builds the executable and runs Go tests, Go vet, and syntax checks for the dashboard and analysis worker.
+The Android workflow compiles and lints the APK. Android JVM tests exercise encoder timestamp matching and exclusion of camera-reported output loss. The Windows workflow builds the executable and runs Go tests, Go vet, and syntax checks for the dashboard and analysis worker.
 
 Go tests cover capture correlation, reconnect between exposures, interrupted journal recovery, synthetic stellar HFR/FWHM, dark/flat correction, and uncompressed Bayer DNG decoding. The local dashboard smoke test uses a mock phone and exercises discovery, preview, video mode selection, still sequence delivery, and live-stack PNG export.
 

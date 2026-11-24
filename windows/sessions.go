@@ -10,13 +10,15 @@ import (
 )
 
 type SessionRecord struct {
-	ID          string            `json:"id"`
-	State       SequenceState     `json:"state"`
-	Controls    map[string]any    `json:"-"`
-	Raw         bool              `json:"-"`
-	JPEG        bool              `json:"-"`
-	Calibration map[string]string `json:"-"`
-	Files       int               `json:"files"`
+	PendingID    string            `json:"-"`
+	PendingIndex int               `json:"-"`
+	ID           string            `json:"id"`
+	State        SequenceState     `json:"state"`
+	Controls     map[string]any    `json:"-"`
+	Raw          bool              `json:"-"`
+	JPEG         bool              `json:"-"`
+	Calibration  map[string]string `json:"-"`
+	Files        int               `json:"files"`
 }
 
 func readSession(path, id string) SessionRecord {
@@ -30,18 +32,20 @@ func readSession(path, id string) SessionRecord {
 	scan.Buffer(make([]byte, 4096), 2<<20)
 	for scan.Scan() {
 		var event struct {
-			Kind        string            `json:"event"`
-			Time        string            `json:"time"`
-			Target      string            `json:"target"`
-			Mode        string            `json:"mode"`
-			FrameType   string            `json:"frame_type"`
-			Requested   int               `json:"requested"`
-			Interval    int               `json:"interval_ms"`
-			State       SequenceState     `json:"sequence"`
-			Controls    map[string]any    `json:"controls"`
-			Raw         bool              `json:"raw"`
-			JPEG        *bool             `json:"jpeg"`
-			Calibration map[string]string `json:"calibration"`
+			CaptureID     string            `json:"capture_id"`
+			ExposureIndex int               `json:"exposure_index"`
+			Kind          string            `json:"event"`
+			Time          string            `json:"time"`
+			Target        string            `json:"target"`
+			Mode          string            `json:"mode"`
+			FrameType     string            `json:"frame_type"`
+			Requested     int               `json:"requested"`
+			Interval      int               `json:"interval_ms"`
+			State         SequenceState     `json:"sequence"`
+			Controls      map[string]any    `json:"controls"`
+			Raw           bool              `json:"raw"`
+			JPEG          *bool             `json:"jpeg"`
+			Calibration   map[string]string `json:"calibration"`
 		}
 		if json.Unmarshal(scan.Bytes(), &event) != nil {
 			continue
@@ -54,8 +58,13 @@ func readSession(path, id string) SessionRecord {
 			if event.JPEG != nil {
 				out.JPEG = *event.JPEG
 			}
+		case "capture_requested":
+			out.PendingID, out.PendingIndex = event.CaptureID, event.ExposureIndex
 		case "sequence_progress", "sequence_finished":
 			out.State = event.State
+			if out.State.Completed > out.PendingIndex {
+				out.PendingID = ""
+			}
 		case "file_received":
 			out.Files++
 		}
