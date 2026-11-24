@@ -147,19 +147,25 @@ jobs:
               raise AssertionError(f"expected frame {expected}, received {shape}")
           
           
-          def choose_exit_button(label):
-              adb("shell", "input", "keyevent", "4")
-              for _ in range(4):
+          def choose_exit_button(label, connection):
+              for _ in range(5):
+                  connection.call("ping")
                   adb("shell", "uiautomator", "dump", "/sdcard/tod-window.xml")
                   root = ET.fromstring(adb("shell", "cat", "/sdcard/tod-window.xml"))
                   nodes = list(root.iter("node"))
-                  if not any(node.get("text") == "Exit TOD Astro Photography?" for node in nodes):
-                      time.sleep(.2)
-                      continue
-                  button = next(node for node in nodes if node.get("text", "").upper() == label)
-                  x0, y0, x1, y1 = map(int, re.findall(r"\d+", button.get("bounds", "")))
-                  adb("shell", "input", "tap", str((x0+x1)//2), str((y0+y1)//2))
-                  return
+                  dialog = any(node.get("text") == "Exit TOD Astro Photography?" for node in nodes)
+                  if dialog:
+                      key = "android:id/button2" if label == "CANCEL" else "android:id/button1"
+                  else:
+                      key = "com.tod.astrophotography:id/exitButton"
+                  button = next((node for node in nodes if node.get("resource-id") == key), None)
+                  if button is not None:
+                      x0, y0, x1, y1 = map(int, re.findall(r"[0-9]+", button.get("bounds", "")))
+                      adb("shell", "input", "tap", str((x0+x1)//2), str((y0+y1)//2))
+                      if dialog:
+                          time.sleep(.5)
+                          return
+                  time.sleep(.25)
               raise AssertionError("Android exit confirmation did not appear")
           
           
@@ -317,9 +323,9 @@ jobs:
                       assert len(restarted_event["files"]) == 1, restarted_event
                       print("Native emulator cancelled an active JPEG burst and saved a subsequent still", flush=True)
           
-              choose_exit_button("CANCEL")
+              choose_exit_button("CANCEL", control)
               control.call("ping")
-              choose_exit_button("EXIT")
+              choose_exit_button("EXIT", control)
               while control.socket.recv(65536):
                   pass
               print("Android exit confirmation offered cancellation and released the control socket on Exit", flush=True)
