@@ -47,7 +47,8 @@ internal class SurfaceVideoEncoder(
     width: Int,
     height: Int,
     fps: Int,
-    bitrate: Int
+    bitrate: Int,
+    private val orientation: Int
 ) {
     private val codec = MediaCodec.createByCodecName(requireNotNull(avcEncoder(width, height, fps)) { "No AVC encoder for this mode" })
     private val cancelled = AtomicBoolean(false)
@@ -105,6 +106,7 @@ internal class SurfaceVideoEncoder(
         var sawEOS = false
         try {
             val output = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            output.setOrientationHint(orientation)
             muxer = output
             val info = MediaCodec.BufferInfo()
             while (!cancelled.get()) {

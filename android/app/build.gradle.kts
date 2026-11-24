@@ -11,8 +11,8 @@ android {
         applicationId = "com.tod.astrophotography"
         minSdk = 29
         targetSdk = 35
-        versionCode = 100
-        versionName = "1.0 Engineering RC"
+        versionCode = 101
+        versionName = "1.0.1 Stability RC"
     }
 
     buildTypes {

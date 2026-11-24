@@ -49,6 +49,7 @@ class CameraController(
     private val activity: Activity,
     private val textureView: TextureView,
     private val frameSink: (ByteArray) -> Unit,
+    private val hasPreviewClient: () -> Boolean,
     private val eventSink: (JSONObject) -> Unit,
     private val statusSink: (String) -> Unit,
     private val zoomSink: (Double) -> Unit
@@ -59,10 +60,35 @@ class CameraController(
     private val previewThread = HandlerThread("TOD-Preview-Encoder").apply { start() }
     private val previewHandler = Handler(previewThread.looper)
     @Volatile private var quality = ValidationPolicy.Preview.BALANCED
+    @Volatile private var thermalStatus = 0
+    fun setThermalStatus(value: Int) { thermalStatus = value }
+    private var previewSessionStarted = 0L
+    private var previewRecoveryAt = 0L
+    private var cameraGeneration = 0
+    private val previewWatchdog = object : Runnable {
+        override fun run() {
+            if (!started) return
+            val now = System.nanoTime()
+            val period = if (manualEnabled) exposureTimeNs else 0L
+            if (session != null && !recording && videoEncoder == null && !maximumCapture &&
+                synchronized(captureLock) { pendingCapture == null } &&
+                now - maxOf(lastPreviewNs.get(), previewSessionStarted, previewRecoveryAt) > maxOf(10_000_000_000L, period * 2)) {
+                previewRecoveryAt = now
+                statusSink("Preview stalled • rebuilding camera session")
+                runCatching { configureReadersAndSession(hardwareRawSupported && rawSize != null) }
+                    .onFailure { statusSink("Preview recovery failed: ${it.message}") }
+            }
+            cameraHandler.postDelayed(this, 3000)
+        }
+    }
     @Volatile private var profile = ValidationPolicy.DAYLIGHT
     @Volatile private var profileName = "Validation / Daylight"
     @Volatile private var displayDegrees = 0
-    @Volatile private var streamRotation = 0
+    private data class PreviewOrientation(val manual: Int? = null, val flipX: Boolean = false, val flipY: Boolean = false)
+    @Volatile private var previewOrientation = PreviewOrientation()
+    private fun jpegRotation() = ValidationPolicy.rotation(sensorOrientation(), displayDegrees,
+        characteristics?.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT)
+    private val streamRotation get() = previewOrientation.manual ?: jpegRotation()
     @Volatile private var textureSize = Size(1280,720)
     @Volatile private var tapRegion: MeteringRectangle? = null
     private var previewRotationBuffer = ByteArray(0)
@@ -78,7 +104,8 @@ class CameraController(
                 Surface.ROTATION_270 -> 270
                 else -> 0
             }
-            streamRotation = ValidationPolicy.rotation(sensorOrientation(),displayDegrees)
+            val orientation = previewOrientation
+            val rotation = orientation.manual ?: jpegRotation()
             val w = textureView.width.toFloat()
             val h = textureView.height.toFloat()
             if (w <= 0 || h <= 0) return@runOnUiThread
@@ -86,11 +113,12 @@ class CameraController(
             // Counter display rotation and fit the rotated stream without stretching.
             val size = textureSize
             val natural = ValidationPolicy.oriented(size.width,size.height,sensorOrientation())
-            val target = ValidationPolicy.oriented(size.width,size.height,streamRotation)
+            val target = ValidationPolicy.oriented(size.width,size.height,rotation)
             val scale = minOf(w/target.width,h/target.height)
             val transform = Matrix().apply {
                 setScale(natural.width*scale/w,natural.height*scale/h,w/2,h/2)
-                postRotate(-displayDegrees.toFloat(),w/2,h/2)
+                postRotate((rotation - sensorOrientation()).toFloat(),w/2,h/2)
+                postScale(if (orientation.flipX) -1f else 1f, if (orientation.flipY) -1f else 1f, w/2, h/2)
             }
             textureView.setTransform(transform)
         }
@@ -104,9 +132,11 @@ class CameraController(
         val c = characteristics ?: return false
         if (profile != ValidationPolicy.DAYLIGHT || manualFocus || recording || !supportsTap(c)) return false
         val size = textureSize
+        val orientation = previewOrientation
+        val rotation = orientation.manual ?: jpegRotation()
         val point = ValidationPolicy.displayPoint(x.toDouble(),y.toDouble(),textureView.width,textureView.height,
-            ValidationPolicy.oriented(size.width,size.height,streamRotation),zoom) ?: return false
-        val target = ValidationPolicy.sensorPoint(point,streamRotation)
+            ValidationPolicy.oriented(size.width,size.height,rotation),zoom) ?: return false
+        val target = ValidationPolicy.sensorPoint(point,rotation,orientation.flipX,orientation.flipY)
         val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return false
         val streamAspect = size.width.toDouble()/size.height
         val fitWidth = minOf(active.width(), (active.height()*streamAspect).toInt())
@@ -153,6 +183,7 @@ class CameraController(
             .put("camera_id",cameraId ?: JSONObject.NULL).put("active_physical_id",physical ?: JSONObject.NULL)
             .put("main_rear",isMain ?: JSONObject.NULL).put("sensor_orientation",sensorOrientation())
             .put("display_rotation",displayDegrees).put("preview_rotation",streamRotation)
+            .put("preview_orientation", orientationState())
             .put("preview_width",size.width).put("preview_height",size.height)
             .put("preview_quality",quality.name).put("jpeg_width",if(::jpegSize.isInitialized) jpegSize.width else 0)
             .put("jpeg_height",if(::jpegSize.isInitialized) jpegSize.height else 0).put("display_zoom",zoom)
@@ -218,6 +249,8 @@ class CameraController(
     private var oisEnabled = false
     private var eisEnabled = false
     private var roiPercent = 100
+    private var exposureCompensation = 0
+    private var meteringMode = "camera"
 
     private val lastPreviewNs = AtomicLong(0L)
     @Volatile var previewHistogram = IntArray(0)
@@ -258,6 +291,7 @@ class CameraController(
             try {
                 chooseCamera()
                 openCamera()
+                cameraHandler.postDelayed(previewWatchdog, 3000)
             } catch (e: Exception) {
                 statusSink("Camera start error: ${e.message}")
                 started = false
@@ -268,6 +302,8 @@ class CameraController(
     fun stop() {
         started = false
         cameraHandler.post {
+            cameraHandler.removeCallbacks(previewWatchdog)
+            if (synchronized(captureLock) { pendingCapture != null }) failPending("Camera closed during capture")
             recordingTimer?.let(cameraHandler::removeCallbacks)
             recordingTimer = null
             if (recording || videoEncoder != null) {
@@ -331,8 +367,11 @@ class CameraController(
                 val ranges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
                 map.getOutputSizes(MediaCodec::class.java)?.sortedByDescending { it.width.toLong() * it.height }?.forEach { size ->
                     val minDuration = map.getOutputMinFrameDuration(MediaCodec::class.java, size)
-                    ranges.filter { it.lower == it.upper && ImagingPolicy.standardVideoTiming(it.upper,minDuration) && avcEncoder(size.width,size.height,it.upper) != null }.distinct().forEach {
-                        videoModes.put("${size.width}×${size.height} @ ${it.upper} fps")
+                    ranges.sortedByDescending { it.lower }.distinctBy { it.upper }.filter {
+                        ImagingPolicy.standardVideoTiming(it.upper, minDuration) && avcEncoder(size.width, size.height, it.upper) != null
+                    }.forEach {
+                        val rate = if (it.lower == it.upper) "${it.upper}" else "${it.lower}-${it.upper}"
+                        videoModes.put("${size.width}×${size.height} @ $rate fps")
                     }
                 }
             } catch (_: Exception) {}
@@ -360,6 +399,9 @@ class CameraController(
             .put("camera_ids", JSONArray(cameraManager.cameraIdList.toList()))
             .put("sensor_width", chars?.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.width ?: 0)
             .put("sensor_height", chars?.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.height ?: 0)
+            .put("ae_compensation", compensationCapability(chars))
+            .put("metering_modes", JSONArray(meteringModes(chars)))
+            .put("manual_wb_temperature_tint", false)
             .put("awb_modes", JSONArray(chars?.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList() ?: emptyList<Int>()))
             .put("diagnostics",diagnostics())
             .put("preview_qualities",JSONArray(ValidationPolicy.Preview.entries.map { it.name }))
@@ -408,7 +450,76 @@ class CameraController(
 
     @Volatile private var awbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
 
+    private fun compensationCapability(chars: CameraCharacteristics?): JSONObject {
+        val range = chars?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val step = chars?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toDouble() ?: 0.0
+        return JSONObject().put("min", range?.lower ?: 0).put("max", range?.upper ?: 0)
+            .put("step_ev", step.takeIf { it.isFinite() } ?: 0.0)
+    }
+
+    private fun meteringModes(chars: CameraCharacteristics?): List<String> =
+        if ((chars?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0)
+            listOf("camera", "center", "spot") else listOf("camera")
+
+    private fun orientationState() = previewOrientation.let {
+        JSONObject().put("rotation", it.manual ?: JSONObject.NULL)
+            .put("flip_x", it.flipX).put("flip_y", it.flipY)
+    }
+
+    fun setRemoteControls(payload: JSONObject): JSONObject {
+        val task = java.util.concurrent.FutureTask { setControls(payload) }
+        if (!cameraHandler.post(task)) return JSONObject().put("ok", false).put("error", "Camera unavailable")
+        return try { task.get(3, java.util.concurrent.TimeUnit.SECONDS) }
+        catch (e: Exception) {
+            task.cancel(false)
+            JSONObject().put("ok", false).put("error", e.cause?.message ?: "Camera did not confirm controls")
+        }
+    }
+
+    private fun switchCamera(id: String): JSONObject {
+        if (id == cameraId) return JSONObject().put("ok", true).put("camera_id", id)
+        if (id !in cameraManager.cameraIdList)
+            return JSONObject().put("ok", false).put("error", "Camera is unavailable or cannot be opened independently")
+        if (videoEncoder != null || recording || synchronized(captureLock) { pendingCapture != null })
+            return JSONObject().put("ok", false).put("error", "Finish the current capture before changing cameras")
+        val previous = cameraId
+        return try {
+            chooseCamera(id)
+            tapRegion = null
+            manualEnabled = false
+            manualFocus = false
+            fixedColor = null
+            measuredColor = null
+            effective = JSONObject()
+            aeLock = false
+            awbLock = false
+            awbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
+            eisEnabled = false
+            roiPercent = 100
+            exposureCompensation = 0
+            meteringMode = "camera"
+            processing.clear()
+            cameraGeneration++
+            session?.close()
+            session = null
+            repeatingBuilder = null
+            rawSessionAvailable = false
+            cameraDevice?.close()
+            cameraDevice = null
+            eventSink(JSONObject().put("event", "camera_changed"))
+            openCamera()
+            JSONObject().put("ok", true).put("camera_id", id).put("status", "opening")
+        } catch (e: Exception) {
+            if (cameraDevice == null && previous != null) runCatching {
+                chooseCamera(previous)
+                recoverCamera("Camera switch failed")
+            }
+            JSONObject().put("ok", false).put("error", e.message ?: "Camera switch failed")
+        }
+    }
+
     fun setControls(payload: JSONObject): JSONObject {
+        if (payload.has("camera_id")) return switchCamera(payload.optString("camera_id"))
         val chars = characteristics ?: return JSONObject().put("ok", false).put("error", "Camera not ready")
         val sensorRange: Range<Int>? = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
         val exposureRange: Range<Long>? = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
@@ -416,6 +527,18 @@ class CameraController(
 
         val supportsManual = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        if (payload.has("preview_orientation")) {
+            val value = payload.optJSONObject("preview_orientation")
+                ?: return JSONObject().put("ok", false).put("error", "Invalid preview orientation")
+            val rotation = if (value.isNull("rotation")) null else value.optInt("rotation", -1)
+            if (rotation != null && rotation !in listOf(0, 90, 180, 270))
+                return JSONObject().put("ok", false).put("error", "Choose Auto, 0, 90, 180 or 270 degrees")
+            previewOrientation = PreviewOrientation(rotation, value.optBoolean("flip_x"), value.optBoolean("flip_y"))
+            tapRegion = null
+            refreshTransform()
+            if (!recording) cameraHandler.post { applyRepeatingControls() }
+            return JSONObject().put("ok", true).put("preview_orientation", orientationState())
+        }
         if (payload.has("display_zoom")) {
             updateDisplayZoom(payload.optDouble("display_zoom", zoom))
             if (payload.length() == 1) return JSONObject().put("ok",true).put("display_zoom",zoom)
@@ -425,15 +548,34 @@ class CameraController(
                 ?: return JSONObject().put("ok",false).put("error","Unknown preview quality")
             if (recording || videoEncoder != null || synchronized(captureLock) { pendingCapture != null })
                 return JSONObject().put("ok",false).put("error","Change preview quality between captures")
-            cameraHandler.post {
-                if (started && !recording && videoEncoder == null && synchronized(captureLock) { pendingCapture == null }) {
+            val change = Runnable {
+                if (started && quality != next && !recording && videoEncoder == null && synchronized(captureLock) { pendingCapture == null }) {
                     quality = next
                     previewSize = selectPreview(next)
                     configureReadersAndSession(hardwareRawSupported && rawSize != null)
                 }
             }
-            return JSONObject().put("ok",true).put("preview_quality",next.name)
+            if (android.os.Looper.myLooper() == cameraHandler.looper) change.run() else cameraHandler.post(change)
+            return JSONObject().put("ok",true).put("preview_quality",next.name).put("status","configuring")
         }
+        val exposureRangeSteps = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        if (payload.has("ae_compensation") && !(exposureRangeSteps ?: Range(0, 0))
+                .contains(payload.optInt("ae_compensation", Int.MIN_VALUE)))
+            return JSONObject().put("ok", false).put("error", "Unsupported exposure compensation")
+        val metering = payload.optString("metering_mode", meteringMode)
+        if (metering !in meteringModes(chars))
+            return JSONObject().put("ok", false).put("error", "Unsupported metering mode")
+        if (payload.optBoolean("manual") && !supportsManual)
+            return JSONObject().put("ok", false).put("error", "Camera does not support manual exposure")
+        if (payload.optBoolean("manual_focus") && minFocus <= 0)
+            return JSONObject().put("ok", false).put("error", "Camera does not support manual focus")
+        if (payload.optBoolean("fixed_color") && !supportsFixedColor(chars))
+            return JSONObject().put("ok", false).put("error", "Camera does not support freezing white balance")
+        if (payload.has("wb_temperature") || payload.has("wb_tint"))
+            return JSONObject().put("ok", false).put("error", "Temperature and tint controls are unavailable; use the supported white balance presets")
+        val advertisedAwb = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
+        if (payload.has("awb_mode") && advertisedAwb?.contains(payload.optInt("awb_mode")) != true)
+            return JSONObject().put("ok", false).put("error", "Unsupported white balance mode")
         val requestedProfile = payload.optString("profile")
         if (requestedProfile in listOf(ValidationPolicy.DAYLIGHT,ValidationPolicy.ASTRONOMY)) {
             if (profile != requestedProfile || payload.optBoolean("reset_profile")) {
@@ -448,6 +590,8 @@ class CameraController(
                 oisEnabled = requestedProfile == ValidationPolicy.DAYLIGHT
                 eisEnabled = false
                 roiPercent = 100
+                exposureCompensation = 0
+                meteringMode = "camera"
             }
             profile = requestedProfile
             profileName = payload.optString("profile_name",if (profile == ValidationPolicy.DAYLIGHT) "Validation / Daylight" else "Astronomy")
@@ -469,8 +613,7 @@ class CameraController(
         if (payload.has("manual")) manualEnabled = supportsManual && payload.optBoolean("manual")
         if (payload.has("awb_mode")) {
             val requested = payload.optInt("awb_mode", CaptureRequest.CONTROL_AWB_MODE_AUTO)
-            if (chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.contains(requested) == true &&
-                requested != CaptureRequest.CONTROL_AWB_MODE_OFF) awbMode = requested
+            if (requested != CaptureRequest.CONTROL_AWB_MODE_OFF) awbMode = requested
         }
         if (profile == ValidationPolicy.DAYLIGHT && !wasManual && manualEnabled && exposureRange != null && sensorRange != null) {
             val result = effective
@@ -502,8 +645,15 @@ class CameraController(
         if (payload.has("ois")) oisEnabled = ImagingPolicy.stabilization(payload.optBoolean("ois") || payload.optString("ois") == "on",chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION))
         if (payload.has("eis")) eisEnabled = ImagingPolicy.stabilization(payload.optBoolean("eis") || payload.optString("eis") == "on",chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES))
         if (payload.has("roi_percent")) roiPercent = payload.optInt("roi_percent", roiPercent).coerceIn(25, 100)
-        cameraHandler.post { applyRepeatingControls() }
-        return controlState()
+        if (payload.has("ae_compensation")) exposureCompensation = payload.optInt("ae_compensation")
+        if (payload.has("metering_mode")) meteringMode = metering
+        if (android.os.Looper.myLooper() == cameraHandler.looper) {
+            if (session == null || repeatingBuilder == null)
+                return JSONObject().put("ok", false).put("error", "Camera preview is not ready for controls")
+            if (!applyRepeatingControls())
+                return JSONObject().put("ok", false).put("error", "Camera2 rejected the control update")
+        } else cameraHandler.post { applyRepeatingControls() }
+        return controlState().put("effective", measured())
     }
 
     fun controlState(): JSONObject = JSONObject().put("ok", true)
@@ -515,6 +665,7 @@ class CameraController(
             .put("manual", manualEnabled)
             .put("profile",profile).put("profile_name",profileName)
             .put("ae_lock", aeLock)
+            .put("ae_compensation", exposureCompensation).put("metering_mode", meteringMode)
             .put("awb_lock", awbLock)
             .put("ois", oisEnabled)
             .put("eis", eisEnabled)
@@ -582,6 +733,13 @@ class CameraController(
         }
         cameraHandler.post {
             val pending = synchronized(captureLock) { pendingCapture }
+            val exposureMs = if (manualEnabled) exposureTimeNs / 1_000_000 else 0
+            cameraHandler.postDelayed({
+                if (synchronized(captureLock) { pendingCapture === pending } && pending != null) {
+                    failPending("Camera did not deliver all capture outputs")
+                    if (!maximum && started) configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
+                }
+            }, maxOf(15_000L, exposureMs * count + 15_000L))
             val deadline = System.nanoTime()+700_000_000L
             lateinit var take: Runnable
             take = Runnable {
@@ -594,6 +752,23 @@ class CameraController(
             take.run()
         }
         return JSONObject().put("ok", true).put("status", "capture_started").put("raw", wantsRaw)
+    }
+
+    fun cancelCapture(payload: JSONObject): JSONObject {
+        val id = payload.optString("capture_id")
+        if (id.isBlank()) return JSONObject().put("ok", false).put("error", "Capture ID required")
+        val task = java.util.concurrent.FutureTask {
+            val pending = synchronized(captureLock) { pendingCapture }
+            if (pending?.captureId == id) {
+                runCatching { session?.abortCaptures() }
+                failPending("Capture cancelled")
+                if (session != null && started) configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
+            }
+            JSONObject().put("ok", true)
+        }
+        if (!cameraHandler.post(task)) return JSONObject().put("ok", false).put("error", "Camera unavailable")
+        return try { task.get(3, java.util.concurrent.TimeUnit.SECONDS) }
+        catch (_: Exception) { JSONObject().put("ok", false).put("error", "Camera did not confirm cancellation") }
     }
 
     fun startVideo(payload: JSONObject): JSONObject {
@@ -614,7 +789,7 @@ class CameraController(
                 recordingFile?.delete()
                 recordingFile = null
                 recording = false
-                eventSink(JSONObject().put("event", "capture_error").put("message", "Video start failed: ${e.message}"))
+                eventSink(JSONObject().put("event", "capture_error").put("kind", "video").put("message", "Video start failed: ${e.message}"))
                 if (session == null && started) configureReadersAndSession(includeRaw = hardwareRawSupported)
             }
         }
@@ -628,23 +803,26 @@ class CameraController(
     }
 
     private fun configureRecording(requestedWidth: Int, requestedHeight: Int, requestedFps: Int, bitrate: Int, highSpeed: Boolean, durationMs: Long, rankFrames: Boolean, frameLimit: Long) {
-        val camera = cameraDevice ?: return
-        val chars = characteristics ?: return
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
+        val camera = checkNotNull(cameraDevice) { "Camera unavailable" }
+        val chars = checkNotNull(characteristics) { "Camera characteristics unavailable" }
+        val map = checkNotNull(chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)) { "Video stream configuration unavailable" }
         check(!recording && videoEncoder == null) { "Video is already starting or recording" }
         check(synchronized(captureLock) { pendingCapture == null }) { "A still capture is in progress" }
         val size = Size(requestedWidth, requestedHeight)
         val fps = requestedFps
-        val range = Range(fps, fps)
-        if (highSpeed) {
+        val range = if (highSpeed) {
+            val fixed = Range(fps, fps)
             require(map.highSpeedVideoSizes.contains(size) &&
-                map.getHighSpeedVideoFpsRangesFor(size).contains(range)) { "Unsupported high-speed video mode" }
+                map.getHighSpeedVideoFpsRangesFor(size).contains(fixed)) { "Unsupported high-speed video mode" }
+            fixed
         } else {
-            require(map.getOutputSizes(MediaCodec::class.java)?.contains(size) == true &&
-                chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.contains(range) == true &&
+            val aeRange = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
+                .filter { it.upper == fps }.maxByOrNull { it.lower }
+            require(map.getOutputSizes(MediaCodec::class.java)?.contains(size) == true && aeRange != null &&
                 ImagingPolicy.standardVideoTiming(fps,map.getOutputMinFrameDuration(MediaCodec::class.java, size))) {
                 "Unsupported video resolution or FPS"
             }
+            aeRange
         }
         repeatingBuilder = null
         try { session?.stopRepeating() } catch (_: Exception) {}
@@ -654,7 +832,7 @@ class CameraController(
         try { videoEncoder?.release() } catch (_: Exception) {}
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         val out = File(captureDir(), "TOD_VIDEO_$stamp.mp4")
-        val recorder = SurfaceVideoEncoder(out, size.width, size.height, fps, bitrate)
+        val recorder = SurfaceVideoEncoder(out, size.width, size.height, fps, bitrate, jpegRotation())
         videoEncoder = recorder
         recordingFile = out
         val texture = textureView.surfaceTexture ?: throw IllegalStateException("Preview surface is not ready")
@@ -736,9 +914,10 @@ class CameraController(
                         cameraHandler.postDelayed(timer, durationMs)
                     }
                     statusSink("Recording ${size.width}×${size.height} @ ${fps} fps")
-                    eventSink(JSONObject().put("event", "video_started").put("path", out.absolutePath).put("width", size.width).put("height", size.height).put("fps", fps))
+                    eventSink(JSONObject().put("event", "video_started").put("path", out.absolutePath)
+                        .put("width", size.width).put("height", size.height).put("fps", fps).put("fps_min", range.lower))
                 } catch (e: Exception) {
-                    eventSink(JSONObject().put("event", "capture_error").put("message", "Video start failed: ${e.message}"))
+                    eventSink(JSONObject().put("event", "capture_error").put("kind", "video").put("message", "Video start failed: ${e.message}"))
                     try { recorder.release() } catch (_: Exception) {}
                     videoEncoder = null
                     recordingFile = null
@@ -748,7 +927,7 @@ class CameraController(
             }
             override fun onConfigureFailed(captureSession: CameraCaptureSession) {
                 captureSession.close()
-                eventSink(JSONObject().put("event", "capture_error").put("message", "Video session configuration failed"))
+                eventSink(JSONObject().put("event", "capture_error").put("kind", "video").put("message", "Video session configuration failed"))
                 try { recorder.release() } catch (_: Exception) {}
                 videoEncoder = null
                 recordingFile = null
@@ -758,6 +937,17 @@ class CameraController(
         }
         if (highSpeed) camera.createConstrainedHighSpeedCaptureSession(outputs, callback, cameraHandler)
         else camera.createCaptureSession(outputs, callback, cameraHandler)
+        cameraHandler.postDelayed({
+            if (!recording && videoEncoder === recorder) {
+                recorder.release()
+                videoEncoder = null
+                recordingFile = null
+                out.delete()
+                eventSink(JSONObject().put("event", "capture_error").put("kind", "video")
+                    .put("message", "Camera did not configure the recording session"))
+                if (started) configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
+            }
+        }, 12_000)
     }
 
     private fun stopRecordingInternal() {
@@ -801,12 +991,12 @@ class CameraController(
             }
         } else if (file != null) {
             try { file.delete() } catch (_: Exception) {}
-            eventSink(JSONObject().put("event", "capture_error").put("message", "Video recording did not finalize correctly"))
+            eventSink(JSONObject().put("event", "capture_error").put("kind", "video").put("message", "Video recording did not finalize correctly"))
         }
         if (started) configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
     }
 
-    private fun chooseCamera() {
+    private fun chooseCamera(requestedId: String? = null) {
         val accessible = cameraManager.cameraIdList.associateWith { cameraManager.getCameraCharacteristics(it) }
         val inventory = accessible.toMutableMap()
         accessible.values.flatMap { it.physicalCameraIds }.distinct().forEach { id ->
@@ -828,7 +1018,7 @@ class CameraController(
             ImagingPolicy.chooseMain(c.physicalCameraIds.mapNotNull { child -> inventory[child]?.let { lens(child,it) } }) ?: lens(id,c)
         }
         val best = ImagingPolicy.chooseMain(representatives.values.toList()) ?: error("No usable rear camera")
-        val id = representatives.entries.filter { it.value.id == best.id }
+        val id = requestedId ?: representatives.entries.filter { it.value.id == best.id }
             .maxWithOrNull(compareBy<Map.Entry<String, RearLens>> {
                 accessible.getValue(it.key).get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
                     ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
@@ -842,13 +1032,15 @@ class CameraController(
             }
         }
         val map = selected.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: error("No stream map")
+        val nativeJpeg = ImagingPolicy.largestSize(map.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty(), Size::getWidth, Size::getHeight)
+            ?: error("No native JPEG output")
+        require(!map.getOutputSizes(ImageFormat.YUV_420_888).isNullOrEmpty()) { "Camera has no YUV preview" }
         characteristics = selected
         previewSize = selectPreview(quality)
         oisEnabled = profile == ValidationPolicy.DAYLIGHT &&
             selected.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.contains(1)==true
         refreshTransform()
-        standardJpegSize = ImagingPolicy.largestSize(map.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty(),Size::getWidth,Size::getHeight)
-            ?: error("No native JPEG output")
+        standardJpegSize = nativeJpeg
         jpegSize = ImagingPolicy.largestSize(map.getHighResolutionOutputSizes(ImageFormat.JPEG)?.toList().orEmpty() + standardJpegSize, Size::getWidth,Size::getHeight)!!
         maximumJpegSize = maximumJpeg(selected)
         hardwareRawSupported = selected.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
@@ -856,8 +1048,9 @@ class CameraController(
         rawSize = if (hardwareRawSupported) ImagingPolicy.largestSize(map.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty(), Size::getWidth,Size::getHeight) else null
         cameraId = id
         characteristics = selected
-        setControls(JSONObject().put("iso",iso).put("exposure_us",exposureTimeNs/1000.0))
-        statusSink("Rear camera $id • Preview ${previewSize.width}×${previewSize.height} • JPEG ${jpegSize.width}×${jpegSize.height}")
+        selected.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { iso = iso.coerceIn(it.lower, it.upper) }
+        selected.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { exposureTimeNs = exposureTimeNs.coerceIn(it.lower, it.upper) }
+        statusSink("Camera $id • Preview ${previewSize.width}×${previewSize.height} • JPEG ${jpegSize.width}×${jpegSize.height}")
     }
 
     private fun describeCamera(id: String, c: CameraCharacteristics, openable: Boolean, lens: RearLens): JSONObject {
@@ -954,7 +1147,7 @@ class CameraController(
                         }
                         describeJpegRequest(request)
                         request.set(CaptureRequest.JPEG_QUALITY,ValidationPolicy.JPEG_QUALITY.toByte())
-                        request.set(CaptureRequest.JPEG_ORIENTATION,streamRotation)
+                        request.set(CaptureRequest.JPEG_ORIENTATION,jpegRotation())
                         request.set(CaptureRequest.SENSOR_PIXEL_MODE,CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
                         request.addTarget(target)
                         configured.capture(request.build(),object: CameraCaptureSession.CaptureCallback() {
@@ -1008,21 +1201,30 @@ class CameraController(
     @SuppressLint("MissingPermission")
     private fun openCamera() {
         val id = cameraId ?: return
+        val generation = ++cameraGeneration
         cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
-                if (!started) { camera.close(); return }
+                if (!started || generation != cameraGeneration) { camera.close(); return }
                 cameraDevice = camera
-                configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
+                try {
+                    configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
+                } catch (e: Exception) {
+                    camera.close()
+                    cameraDevice = null
+                    recoverCamera("Camera session failed: ${e.message}")
+                }
             }
 
             override fun onDisconnected(camera: CameraDevice) {
+                if (!started || generation != cameraGeneration) { camera.close(); return }
                 camera.close(); cameraDevice = null
-                statusSink("Camera disconnected")
+                recoverCamera("Camera disconnected")
             }
 
             override fun onError(camera: CameraDevice, error: Int) {
+                if (!started || generation != cameraGeneration) { camera.close(); return }
                 camera.close(); cameraDevice = null
-                statusSink("Camera error code $error")
+                recoverCamera("Camera error code $error")
             }
         }, cameraHandler)
     }
@@ -1035,14 +1237,12 @@ class CameraController(
         session = null
         repeatingBuilder = null
         rawSessionAvailable = false
+        val generation = cameraGeneration
         val retry = object : Runnable {
             override fun run() {
-                if (!started || cameraDevice != null) return
+                if (!started || cameraDevice != null || generation != cameraGeneration) return
                 try { openCamera() }
-                catch (e: Exception) {
-                    statusSink("Camera unavailable: ${e.message} • retrying")
-                    cameraHandler.postDelayed(this, 3000)
-                }
+                catch (e: Exception) { recoverCamera("Camera unavailable: ${e.message}") }
             }
         }
         cameraHandler.postDelayed(retry, 3000)
@@ -1061,9 +1261,14 @@ class CameraController(
                 try {
                     val now = System.nanoTime()
                     val previous = lastPreviewNs.get()
-                    if (now - previous >= 1_000_000_000L/configuredQuality.fps && lastPreviewNs.compareAndSet(previous, now)) {
+                    val fps = ValidationPolicy.previewFps(configuredQuality.fps, thermalStatus)
+                    if (now - previous >= 1_000_000_000L/fps && lastPreviewNs.compareAndSet(previous, now)) {
                         if (previewFrames.incrementAndGet() % 4L == 1L) previewHistogram = sampleHistogram(image)
-                        frameSink(yuvToJpeg(image,configuredQuality.jpeg,streamRotation))
+                        if (hasPreviewClient()) {
+                            val orientation = previewOrientation
+                            val compression = if (thermalStatus >= 2) minOf(configuredQuality.jpeg, 83) else configuredQuality.jpeg
+                            frameSink(yuvToJpeg(image, compression, orientation.manual ?: jpegRotation(), orientation.flipX, orientation.flipY))
+                        }
                         if (previewFPSWindowNs == 0L) previewFPSWindowNs=now
                         previewFPSCount++
                         if (now-previewFPSWindowNs>=1_000_000_000L) {
@@ -1115,10 +1320,15 @@ class CameraController(
         jpegReader?.surface?.let(outputs::add)
         rawReader?.surface?.let(outputs::add)
 
+        val configuredReader = previewReader
         camera.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(captureSession: CameraCaptureSession) {
-                if (!started) { captureSession.close(); return }
+                if (!started || cameraDevice !== camera || previewReader !== configuredReader) {
+                    captureSession.close()
+                    return
+                }
                 session = captureSession
+                previewSessionStarted = System.nanoTime()
                 rawSessionAvailable = rawReader != null
                 startRepeating()
                 statusSink("Camera ready • PC live stream active")
@@ -1131,6 +1341,7 @@ class CameraController(
 
             override fun onConfigureFailed(captureSession: CameraCaptureSession) {
                 captureSession.close()
+                if (!started || cameraDevice !== camera || previewReader !== configuredReader) return
                 if (quality != ValidationPolicy.Preview.LOW) {
                     quality = ValidationPolicy.Preview.entries[quality.ordinal-1]
                     previewSize = selectPreview(quality)
@@ -1166,14 +1377,16 @@ class CameraController(
         captureSession.setRepeatingRequest(builder.build(), effectiveCallback, cameraHandler)
     }
 
-    private fun applyRepeatingControls() {
-        val builder = repeatingBuilder ?: return
-        val captureSession = session ?: return
-        try {
+    private fun applyRepeatingControls(): Boolean {
+        val builder = repeatingBuilder ?: return false
+        val captureSession = session ?: return false
+        return try {
             applyControls(builder)
             captureSession.setRepeatingRequest(builder.build(), effectiveCallback, cameraHandler)
+            true
         } catch (e: Exception) {
             statusSink("Control update error: ${e.message}")
+            false
         }
     }
 
@@ -1208,6 +1421,10 @@ class CameraController(
         }
         effective = JSONObject().put("fixed_color_ready",measuredColor != null)
             .put("iso",result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
+            .put("ae_compensation",result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION) ?: JSONObject.NULL)
+            .put("awb_mode",result.get(CaptureResult.CONTROL_AWB_MODE) ?: JSONObject.NULL)
+            .put("ae_lock",result.get(CaptureResult.CONTROL_AE_LOCK) ?: JSONObject.NULL)
+            .put("awb_lock",result.get(CaptureResult.CONTROL_AWB_LOCK) ?: JSONObject.NULL)
             .put("exposure_us",result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1000.0) ?: JSONObject.NULL)
             .put("focus_distance",result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: JSONObject.NULL)
             .put("focus_state",ValidationPolicy.focusState(result.get(CaptureResult.CONTROL_AF_MODE)==CaptureRequest.CONTROL_AF_MODE_OFF && manualFocus,
@@ -1283,6 +1500,17 @@ class CameraController(
             }
             val region = framing.crop
             builder.set(CaptureRequest.SCALER_CROP_REGION,Rect(region.left,region.top,region.right,region.bottom))
+            if (!manualEnabled && (chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0) > 0) {
+                val divisor = if (meteringMode == "spot") 8 else 2
+                val width = maxOf(1, (region.right - region.left) / divisor)
+                val height = maxOf(1, (region.bottom - region.top) / divisor)
+                builder.set(CaptureRequest.CONTROL_AE_REGIONS, if (meteringMode == "camera") null else arrayOf(
+                    MeteringRectangle(region.left + (region.right - region.left - width) / 2,
+                        region.top + (region.bottom - region.top - height) / 2,
+                        width, height, MeteringRectangle.METERING_WEIGHT_MAX)))
+            }
+            if (CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION in chars.availableCaptureRequestKeys.orEmpty())
+                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, if (manualEnabled) 0 else exposureCompensation)
         }
         val modes = processingModes(chars)
         for ((name,key) in processingRequests) {
@@ -1301,6 +1529,7 @@ class CameraController(
     private fun performStillCapture(wantsRaw: Boolean, wantsJpeg: Boolean, count: Int) {
         val camera = cameraDevice ?: return failPending("Camera unavailable")
         val captureSession = session ?: return failPending("Session unavailable")
+        val pending = synchronized(captureLock) { pendingCapture } ?: return
         try {
             val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             if (wantsJpeg) jpegReader?.surface?.let(builder::addTarget)
@@ -1309,25 +1538,28 @@ class CameraController(
             if (wantsJpeg) {
                 describeJpegRequest(builder)
                 builder.set(CaptureRequest.JPEG_QUALITY,ValidationPolicy.JPEG_QUALITY.toByte())
-                builder.set(CaptureRequest.JPEG_ORIENTATION,streamRotation)
+                builder.set(CaptureRequest.JPEG_ORIENTATION,jpegRotation())
             }
             val request = builder.build()
             val callback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                     if (wantsRaw) {
-                        synchronized(captureLock) { pendingRawResult = result }
+                        synchronized(captureLock) {
+                            if (pendingCapture !== pending) return
+                            pendingRawResult = result
+                        }
                         tryWriteRaw()
                     }
                 }
 
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
-                    if (session !== this@CameraController.session) return
+                    if (session !== this@CameraController.session || synchronized(captureLock) { pendingCapture !== pending }) return
                     failPending("Capture failed: ${failure.reason}")
                     if (count > 1 && started) configureReadersAndSession(includeRaw = hardwareRawSupported)
                 }
 
                 override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
-                    if (session !== this@CameraController.session) return
+                    if (session !== this@CameraController.session || synchronized(captureLock) { pendingCapture !== pending }) return
                     failPending("Camera lost an output buffer")
                     if (started) configureReadersAndSession(includeRaw = hardwareRawSupported)
                 }
@@ -1461,12 +1693,12 @@ class CameraController(
         return bins
     }
 
-    private fun yuvToJpeg(image: Image, quality: Int, rotation: Int): ByteArray {
+    private fun yuvToJpeg(image: Image, quality: Int, rotation: Int, flipX: Boolean, flipY: Boolean): ByteArray {
         val native = yuv420888ToNv21(image)
         val size = ValidationPolicy.oriented(image.width,image.height,rotation)
-        val pixels = if (rotation == 0) native else {
+        val pixels = if (rotation == 0 && !flipX && !flipY) native else {
             if (previewRotationBuffer.size != native.size) previewRotationBuffer = ByteArray(native.size)
-            ValidationPolicy.rotateNv21(native,previewRotationBuffer,image.width,image.height,rotation)
+            ValidationPolicy.rotateNv21(native,previewRotationBuffer,image.width,image.height,rotation,flipX,flipY)
             previewRotationBuffer
         }
         val yuv = YuvImage(pixels,ImageFormat.NV21,size.width,size.height,null)

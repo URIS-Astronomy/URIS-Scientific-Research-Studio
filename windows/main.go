@@ -14,7 +14,6 @@ import (
 	"image/jpeg"
 	"io"
 	"io/fs"
-	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -30,19 +29,22 @@ import (
 )
 
 const (
-	appName       = "TOD Astro Suite"
-	version       = "1.0 Engineering RC"
-	controlPort   = 47000
-	previewPort   = 47001
-	filePort      = 47002
-	discoveryPort = 47003
-	httpAddr      = "127.0.0.1:47871"
+	appName          = "TOD Astro Suite"
+	version          = "1.0.1 Stability RC"
+	controlPort      = 47000
+	previewPort      = 47001
+	filePort         = 47002
+	previewFreshness = 3 * time.Second
+	discoveryPort    = 47003
+	httpAddr         = "127.0.0.1:47871"
 )
 
 //go:embed web/*
 var webFS embed.FS
 
 type Metrics struct {
+	LastFrame     *time.Time    `json:"last_frame,omitempty"`
+	Live          bool          `json:"live"`
 	Star          *StellarFocus `json:"star,omitempty"`
 	FocusHistory  []float64     `json:"focus_history"`
 	FPS           float64       `json:"fps"`
@@ -79,11 +81,13 @@ type VideoState struct {
 	Width          int            `json:"width"`
 	Height         int            `json:"height"`
 	FPS            int            `json:"fps"`
+	MinFPS         int            `json:"fps_min,omitempty"`
 	StartedAt      string         `json:"started_at"`
 	Message        string         `json:"message"`
 }
 
 type SequenceState struct {
+	Phase         string `json:"phase"`
 	Running       bool   `json:"running"`
 	Target        string `json:"target"`
 	Mode          string `json:"mode"`
@@ -165,25 +169,30 @@ type App struct {
 	videoSessions    map[string]string
 	stack            *LiveStack
 
-	latestFrame   []byte
-	frameETag     string
-	lastFrameTime time.Time
-	frameBytes    uint64
-	frameCounter  uint64
+	latestFrame     []byte
+	frameETag       string
+	lastFrameTime   time.Time
+	frameBytes      uint64
+	windowFrames    uint64
+	windowStart     time.Time
+	lastHeartbeat   time.Time
+	videoTransition time.Time
+	frameCounter    uint64
 
-	connMu         sync.Mutex
-	control        net.Conn
-	writer         *bufio.Writer
-	pending        map[string]chan map[string]any
-	seqID          atomic.Uint64
-	stop           chan struct{}
-	reconnect      chan struct{}
-	captureDone    chan captureResult
-	captureID      string
-	sequenceCancel chan struct{}
-	uiSeen         atomic.Bool
-	lastUI         atomic.Int64
-	quitApp        chan struct{}
+	connMu           sync.Mutex
+	control          net.Conn
+	writer           *bufio.Writer
+	pending          map[string]chan map[string]any
+	seqID            atomic.Uint64
+	stop             chan struct{}
+	reconnect        chan struct{}
+	captureDone      chan captureResult
+	captureID        string
+	sequenceCancel   chan struct{}
+	sequenceFinished chan struct{}
+	sequenceStacking bool
+	diagnostics      []diagnosticEvent
+	quitApp          chan struct{}
 }
 
 func newApp() *App {
@@ -197,7 +206,7 @@ func newApp() *App {
 		lanPath: path, knownLAN: loadLANPreference(path), discover: discoverPhone, usb: bundledADB(), clientSession: hex.EncodeToString(clientKey[:]),
 		device:   DeviceState{Transport: "Offline", Status: "Waiting for TOD Astro Photography", Capabilities: map[string]any{}, Telemetry: map[string]any{}},
 		video:    VideoState{Message: "Idle"},
-		sequence: SequenceState{Mode: "Planetary", FrameType: "Light", Message: "Idle"},
+		sequence: SequenceState{Mode: "Planetary", FrameType: "Light", Phase: "idle", Message: "Idle"},
 		session:  SessionState{Target: "Jupiter", Mode: "Planetary", Root: pictures, CurrentDir: pictures, SirilPath: detectSiril()},
 		pending:  map[string]chan map[string]any{}, stop: make(chan struct{}), reconnect: make(chan struct{}, 1), captureDone: make(chan captureResult, 1), quitApp: make(chan struct{}, 1),
 	}
@@ -215,6 +224,12 @@ func userHome() string {
 }
 
 func detectSiril() string {
+	if exe, err := os.Executable(); err == nil {
+		bundled := bundledSiril(filepath.Join(filepath.Dir(exe), "siril"))
+		if bundled != "" {
+			return bundled
+		}
+	}
 	candidates := []string{
 		filepath.Join(os.Getenv("ProgramFiles"), "Siril", "bin", "siril-cli.exe"),
 		filepath.Join(os.Getenv("ProgramFiles"), "Siril", "siril-cli.exe"),
@@ -233,6 +248,21 @@ func detectSiril() string {
 	return ""
 }
 
+func bundledSiril(directory string) string {
+	var executable string
+	_ = filepath.WalkDir(directory, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() && strings.EqualFold(entry.Name(), "siril-cli.exe") {
+			executable = path
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return executable
+}
+
 func (a *App) snapshot() StateSnapshot {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -245,7 +275,16 @@ func (a *App) snapshot() StateSnapshot {
 	if a.stack != nil {
 		stack = a.stack.snapshot()
 	}
-	return StateSnapshot{LastJPEG: a.lastJPEG, FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: a.metrics, Video: a.video, Sequence: a.sequence, Session: s}
+	metrics := a.metrics
+	if !a.lastFrameTime.IsZero() {
+		last := a.lastFrameTime
+		metrics.LastFrame = &last
+	}
+	metrics.Live = d.Connected && a.previewLiveLocked(time.Now())
+	if !metrics.Live {
+		metrics.FPS, metrics.BitrateMbps = 0, 0
+	}
+	return StateSnapshot{LastJPEG: a.lastJPEG, FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: metrics, Video: a.video, Sequence: a.sequence, Session: s}
 }
 func cloneMap(src map[string]any) map[string]any {
 	out := map[string]any{}
@@ -255,12 +294,28 @@ func cloneMap(src map[string]any) map[string]any {
 	return out
 }
 
+type diagnosticEvent struct {
+	Time   time.Time `json:"time"`
+	Kind   string    `json:"kind"`
+	Detail string    `json:"detail"`
+}
+
+func (a *App) recordDiagnosticLocked(kind, detail string) {
+	const eventLimit = 200
+	if len(a.diagnostics) == eventLimit {
+		copy(a.diagnostics, a.diagnostics[1:])
+		a.diagnostics = a.diagnostics[:eventLimit-1]
+	}
+	a.diagnostics = append(a.diagnostics, diagnosticEvent{time.Now(), kind, detail})
+}
+
 func (a *App) setError(err error) {
 	if err == nil {
 		return
 	}
 	a.mu.Lock()
 	a.device.LastError = err.Error()
+	a.recordDiagnosticLocked("error", err.Error())
 	a.mu.Unlock()
 }
 
@@ -311,6 +366,7 @@ func (a *App) refreshTransport() {
 	a.mu.RLock()
 	active, connected := a.active, a.device.Connected
 	needsCaps := len(a.device.Capabilities) == 0
+	lastHeartbeat := a.lastHeartbeat
 	busy := a.captureID != "" || a.video.Recording || a.video.Message == "Starting"
 	known, manual := a.knownLAN, a.manualLAN
 	usbPower, _ := a.device.Telemetry["usb_power"].(bool)
@@ -321,6 +377,9 @@ func (a *App) refreshTransport() {
 	a.setUSBStatus(info)
 	if connected && (active.kind != transportUSB || active == wired) {
 		if _, err := a.command("ping", nil, 2*time.Second); err == nil {
+			a.mu.Lock()
+			a.lastHeartbeat = time.Now()
+			a.mu.Unlock()
 			if active.kind == transportUSB {
 				a.setUSBStatus(usbStatus{"connected", "USB debugging authorized · PC connected"})
 			} else if wired.control != 0 && !busy {
@@ -334,6 +393,11 @@ func (a *App) refreshTransport() {
 			if needsCaps {
 				a.queryCapabilities()
 			}
+			return
+		}
+		// A delayed response while Camera2 is configuring a session is not
+		// a lost link. The reader handles actual EOF without waiting for ping.
+		if time.Since(lastHeartbeat) < 10*time.Second {
 			return
 		}
 	}
@@ -495,11 +559,14 @@ func (a *App) connectEndpoint(candidate endpoint) bool {
 	a.device.Status = "Connected"
 	a.device.LastError = ""
 	a.device.Protocol, _ = asInt(hello["protocol"])
+	a.lastHeartbeat = time.Now()
+	a.resetPreviewLocked()
+	a.recordDiagnosticLocked("connected", string(candidate.kind))
 	if recording, ok := hello["recording"].(bool); ok {
 		a.video.Recording = recording
 		if recording {
 			a.video.Message = "Recording"
-		} else if a.video.Message == "Recording" {
+		} else if a.video.Message == "Recording" || a.video.Message == "Starting" || a.video.Message == "Stopping" {
 			a.video.Message = "Idle"
 		}
 	}
@@ -560,9 +627,8 @@ func (a *App) disconnectControl(expected net.Conn, reason string) {
 	a.device.Status = "Reconnecting"
 	a.device.Capabilities = map[string]any{}
 	a.device.Telemetry = map[string]any{}
-	a.latestFrame = nil
-	a.metrics = Metrics{}
-	a.lastFrameTime = time.Time{}
+	a.resetPreviewLocked()
+	a.recordDiagnosticLocked("disconnected", reason)
 	if reason != "" {
 		a.device.LastError = reason
 	}
@@ -624,6 +690,8 @@ func (a *App) handleEvent(m map[string]any) {
 	case "camera_changed":
 		a.mu.Lock()
 		a.device.Capabilities = map[string]any{}
+		a.resetPreviewLocked()
+		a.focusPoint = nil
 		a.mu.Unlock()
 	case "display_zoom":
 		a.mu.Lock()
@@ -632,10 +700,24 @@ func (a *App) handleEvent(m map[string]any) {
 		a.mu.Unlock()
 	case "telemetry":
 		a.mu.Lock()
+		previousDiagnostics, _ := a.device.Telemetry["diagnostics"].(map[string]any)
+		diagnostics, _ := m["diagnostics"].(map[string]any)
+		if rotation, ok := diagnostics["preview_rotation"].(float64); ok && previousDiagnostics["preview_rotation"] != nil &&
+			previousDiagnostics["preview_rotation"] != rotation {
+			a.focusPoint = nil
+			a.metrics.FocusHistory = nil
+			a.metrics.Star = nil
+		}
 		a.device.Telemetry = m
-		if recording, ok := m["recording"].(bool); ok && recording {
-			a.video.Recording = true
-			a.video.Message = "Recording"
+		if recording, ok := m["recording"].(bool); ok {
+			if recording && a.video.Message != "Stopping" {
+				a.video.Recording = true
+				a.video.Message = "Recording"
+			} else if !recording && ((a.video.Message == "Recording" || a.video.Message == "Stopping") ||
+				(a.video.Message == "Starting" && time.Since(a.videoTransition) > 15*time.Second)) {
+				a.video.Recording = false
+				a.video.Message = "Idle"
+			}
 		}
 		a.mu.Unlock()
 	case "video_progress":
@@ -685,6 +767,7 @@ func (a *App) handleEvent(m map[string]any) {
 		a.video.Width, _ = asInt(m["width"])
 		a.video.Height, _ = asInt(m["height"])
 		a.video.FPS, _ = asInt(m["fps"])
+		a.video.MinFPS, _ = asInt(m["fps_min"])
 		a.video.StartedAt = time.Now().Format(time.RFC3339)
 		a.video.Message = "Recording"
 		a.mu.Unlock()
@@ -724,7 +807,7 @@ func (a *App) handleEvent(m map[string]any) {
 		if a.currentControls["manual"] != true {
 			exposure = 0
 		}
-		if id != "" && id == a.captureID && a.sequence.Mode == "Live Stack" && frameType == "Light" {
+		if id != "" && id == a.captureID && a.sequence.Mode == "Live Stack" && frameType == "Light" && a.sequenceStacking {
 			stack = a.stack
 		}
 		a.mu.Unlock()
@@ -770,8 +853,11 @@ func (a *App) handleEvent(m map[string]any) {
 	case "capture_error":
 		a.mu.Lock()
 		a.device.LastError = fmt.Sprint(m["message"])
-		a.video.Recording = false
-		a.video.Message = "Error"
+		a.recordDiagnosticLocked("capture_error", a.device.LastError)
+		if m["kind"] == "video" {
+			a.video.Recording = false
+			a.video.Message = "Error"
+		}
 		a.mu.Unlock()
 		id, _ := m["capture_id"].(string)
 		a.completeCapture(captureResult{id: id, err: fmt.Errorf("%s", m["message"])})
@@ -827,6 +913,13 @@ func (a *App) command(cmd string, payload map[string]any, timeout time.Duration)
 }
 
 func (a *App) previewLoop(target endpoint, control net.Conn) {
+	analysis := make(chan []byte)
+	defer close(analysis)
+	go func() {
+		for frame := range analysis {
+			a.analyzeFrame(frame, control)
+		}
+	}()
 	for {
 		a.connMu.Lock()
 		active := a.control == control
@@ -834,7 +927,7 @@ func (a *App) previewLoop(target endpoint, control net.Conn) {
 		if !active {
 			return
 		}
-		a.readPreview(target, control)
+		a.readPreview(target, control, analysis)
 		select {
 		case <-a.stop:
 			return
@@ -843,14 +936,14 @@ func (a *App) previewLoop(target endpoint, control net.Conn) {
 	}
 }
 
-func (a *App) readPreview(target endpoint, control net.Conn) {
+func (a *App) readPreview(target endpoint, control net.Conn, analysis chan<- []byte) {
 	c, err := target.dial(target.preview, 2*time.Second)
 	if err != nil {
 		return
 	}
 	defer c.Close()
 	for {
-		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_ = c.SetReadDeadline(time.Now().Add(previewFreshness))
 		var n uint32
 		if err := binary.Read(c, binary.BigEndian, &n); err != nil {
 			return
@@ -862,43 +955,64 @@ func (a *App) readPreview(target endpoint, control net.Conn) {
 		if _, err := io.ReadFull(c, b); err != nil {
 			return
 		}
-		a.connMu.Lock()
-		current := a.control == control
-		a.connMu.Unlock()
-		if !current {
+		if len(b) < 4 || b[0] != 0xff || b[1] != 0xd8 {
 			return
 		}
-		a.ingestFrame(b)
-	}
-}
-
-func (a *App) ingestFrame(b []byte) {
-	now := time.Now()
-	sum := sha256.Sum256(b)
-	a.mu.Lock()
-	prev := a.lastFrameTime
-	a.latestFrame = append(a.latestFrame[:0], b...)
-	a.frameETag = hex.EncodeToString(sum[:8])
-	a.frameCounter++
-	if !prev.IsZero() {
-		inst := 1 / now.Sub(prev).Seconds()
-		if a.metrics.FPS == 0 {
-			a.metrics.FPS = inst
-		} else {
-			a.metrics.FPS = a.metrics.FPS*0.85 + inst*0.15
+		a.connMu.Lock()
+		if a.control != control {
+			a.connMu.Unlock()
+			return
+		}
+		a.mu.Lock()
+		a.storeFrameLocked(b, time.Now())
+		frameNumber := a.frameCounter
+		a.mu.Unlock()
+		a.connMu.Unlock()
+		if frameNumber%3 == 0 {
+			select {
+			case analysis <- b:
+			default:
+			}
 		}
 	}
+}
+
+func (a *App) previewLiveLocked(now time.Time) bool {
+	return !a.lastFrameTime.IsZero() && now.Sub(a.lastFrameTime) <= previewFreshness
+}
+
+func (a *App) resetPreviewLocked() {
+	a.latestFrame, a.frameETag = nil, ""
+	a.lastFrameTime, a.windowStart = time.Time{}, time.Time{}
+	a.windowFrames, a.frameBytes = 0, 0
+	a.metrics = Metrics{}
+}
+
+func (a *App) storeFrameLocked(b []byte, now time.Time) {
+	newWindow := !a.previewLiveLocked(now)
+	if newWindow {
+		a.windowStart = now
+		a.windowFrames, a.frameBytes = 0, 0
+		a.metrics.FPS, a.metrics.BitrateMbps = 0, 0
+	}
+	a.frameCounter++
+	a.latestFrame = b
+	a.frameETag = strconv.FormatUint(a.frameCounter, 10)
 	a.lastFrameTime = now
-	a.frameBytes += uint64(len(b))
 	a.metrics.Frames = a.frameCounter
-	analyze := a.frameCounter%3 == 0
-	a.mu.Unlock()
-	if analyze {
-		a.analyzeFrame(b)
+	if !newWindow {
+		a.windowFrames++
+		a.frameBytes += uint64(len(b) + 4)
+	}
+	if elapsed := now.Sub(a.windowStart).Seconds(); elapsed >= 1 {
+		a.metrics.FPS = float64(a.windowFrames) / elapsed
+		a.metrics.BitrateMbps = float64(a.frameBytes) * 8 / elapsed / 1e6
+		a.windowStart = now
+		a.windowFrames, a.frameBytes = 0, 0
 	}
 }
 
-func (a *App) analyzeFrame(b []byte) {
+func (a *App) analyzeFrame(b []byte, owner net.Conn) {
 	img, _, err := image.Decode(bytes.NewReader(b))
 	if err != nil {
 		return
@@ -976,8 +1090,10 @@ func (a *App) analyzeFrame(b []byte) {
 	if focusN > 0 {
 		m.FocusScore = focus / float64(focusN)
 	}
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
 	a.mu.Lock()
-	if a.focusPoint != point {
+	if a.control != owner || a.focusPoint != point || !a.previewLiveLocked(time.Now()) {
 		a.mu.Unlock()
 		return
 	}
@@ -987,7 +1103,7 @@ func (a *App) analyzeFrame(b []byte) {
 	}
 	m.Frames = a.frameCounter
 	m.FPS = a.metrics.FPS
-	m.BitrateMbps = a.metrics.FPS * float64(len(b)) * 8 / 1e6
+	m.BitrateMbps = a.metrics.BitrateMbps
 	m.Dropped = a.metrics.Dropped
 	a.metrics = m
 	a.mu.Unlock()
@@ -1135,16 +1251,23 @@ func asInt(v any) (int, bool) {
 }
 
 func (a *App) startSequence(req map[string]any) error {
-	return a.runSequence(req, nil)
+	return a.runSequence(req, nil, false)
 }
 
-func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
+func (a *App) runSequence(req map[string]any, resume *SessionRecord, single bool) error {
 	a.mu.Lock()
-	if a.sequence.Running {
+	if a.sequence.Running || a.videoBusyLocked() {
 		a.mu.Unlock()
-		return fmt.Errorf("sequence already running")
+		return fmt.Errorf("A capture is %s", a.captureActivityLocked())
+	}
+	if !a.device.Connected && resume == nil {
+		a.mu.Unlock()
+		return fmt.Errorf("Phone is offline")
 	}
 	count, _ := asInt(req["count"])
+	if single {
+		count = 1
+	}
 	if count < 1 {
 		count = 1
 	}
@@ -1176,7 +1299,7 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 	if resume != nil {
 		calibrationSelection = resume.Calibration
 	}
-	if mode == "Live Stack" {
+	if mode == "Live Stack" && !single {
 		if ft != "Light" {
 			a.mu.Unlock()
 			return fmt.Errorf("live stacking requires light frames")
@@ -1188,9 +1311,11 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 		stack = &LiveStack{extension: extension}
 		a.stack = stack
 	}
+	if !single || a.session.Target != target || a.session.Mode != mode {
+		a.sessionID = ""
+	}
 	a.session.Target = target
 	a.session.Mode = mode
-	a.sessionID = ""
 	dir := a.ensureSessionDirLocked()
 	controls := cloneMap(a.currentControls)
 	completed := 0
@@ -1207,13 +1332,16 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 	if controls["manual"] != true {
 		exposure = 0
 	}
-	a.sequence = SequenceState{Running: true, Target: target, Mode: mode, FrameType: ft, Requested: count, Completed: completed, IntervalMs: interval, StartedAt: time.Now().Format(time.RFC3339), Message: "Capturing"}
+	a.sequence = SequenceState{Running: true, Phase: "starting", Target: target, Mode: mode, FrameType: ft, Requested: count, Completed: completed, IntervalMs: interval, StartedAt: time.Now().Format(time.RFC3339), Message: "Starting"}
 	if resume != nil {
 		a.sequence.IntegrationUS = resume.State.IntegrationUS
 		a.sequence.StartedAt = resume.State.StartedAt
 	}
 	cancel := make(chan struct{})
+	finished := make(chan struct{})
 	a.sequenceCancel = cancel
+	a.sequenceFinished = finished
+	a.sequenceStacking = stack != nil
 	a.mu.Unlock()
 	raw, _ := req["raw"].(bool)
 	jpeg := true
@@ -1221,27 +1349,51 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 		jpeg = v
 	}
 	go func() {
-		if resume == nil {
+		defer close(finished)
+		if resume == nil && !single {
 			appendSessionLog(dir, map[string]any{
 				"event": "sequence_started", "target": target, "mode": mode, "frame_type": ft,
 				"requested": count, "interval_ms": interval, "controls": controls,
 				"capabilities": capabilities, "telemetry": telemetry, "raw": raw, "jpeg": jpeg,
 				"calibration": req["calibration"],
 			})
-		} else {
+		} else if resume != nil {
 			appendSessionLog(dir, map[string]any{"event": "sequence_resumed", "completed": completed})
 		}
 
 		defer func() {
+			a.mu.RLock()
+			id, stopping := a.captureID, a.sequence.Phase == "stopping"
+			a.mu.RUnlock()
+			var cancelErr error
+			if stopping && id != "" {
+				_, cancelErr = a.command("cancel_capture", map[string]any{"capture_id": id}, 4*time.Second)
+			}
 			a.mu.Lock()
 			a.sequence.Running = false
+			a.sequenceCancel = nil
+			a.sequenceStacking = false
 			a.captureID = ""
-			if a.sequence.Message == "Capturing" {
-				a.sequence.Message = "Complete"
+			switch {
+			case a.sequence.Phase == "stopping":
+				a.sequence.Phase, a.sequence.Message = "completed", "Stopped"
+				if cancelErr != nil {
+					a.sequence.Phase, a.sequence.Message = "failed", "Phone did not confirm cancellation"
+					a.device.LastError = cancelErr.Error()
+				}
+			case a.sequence.Completed == a.sequence.Requested:
+				a.sequence.Phase, a.sequence.Message = "completed", "Complete"
+			default:
+				a.sequence.Phase = "failed"
 			}
 			sequence, metrics, telemetry := a.sequence, a.metrics, cloneMap(a.device.Telemetry)
+			a.recordDiagnosticLocked("capture", sequence.Message)
 			a.mu.Unlock()
-			appendSessionLog(dir, map[string]any{"event": "sequence_finished", "sequence": sequence,
+			event := "sequence_finished"
+			if single {
+				event = "single_capture_finished"
+			}
+			appendSessionLog(dir, map[string]any{"event": event, "sequence": sequence,
 				"received_preview_frames": metrics.Frames, "telemetry": telemetry})
 		}()
 		if stack != nil {
@@ -1269,15 +1421,12 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 		for i := completed; i < count; i++ {
 			select {
 			case <-cancel:
-				a.mu.Lock()
-				a.sequence.Message = "Stopped"
-				a.mu.Unlock()
 				return
 			default:
 			}
 			if err := a.waitForSequenceLink(cancel, dir); err != nil {
 				a.mu.Lock()
-				if a.sequence.Message != "Stopped" {
+				if a.sequence.Phase != "stopping" {
 					a.sequence.Message = "Reconnect timed out"
 					a.device.LastError = err.Error()
 				}
@@ -1300,15 +1449,27 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 			if resume != nil && resume.PendingIndex == i && resume.PendingID != "" {
 				id = resume.PendingID
 			}
-			appendSessionLog(dir, map[string]any{"event": "capture_requested", "capture_id": id, "exposure_index": i})
+			if !single {
+				appendSessionLog(dir, map[string]any{"event": "capture_requested", "capture_id": id, "exposure_index": i})
+			}
 			a.mu.Lock()
 			select {
 			case <-a.captureDone:
 			default:
 			}
 			a.captureID = id
+			if a.sequence.Phase != "stopping" {
+				a.sequence.Phase, a.sequence.Message = "capturing", "Capturing"
+			}
 			a.mu.Unlock()
 			payload := map[string]any{"raw": raw, "jpeg": jpeg, "target": target, "mode": mode, "frame_type": ft, "capture_id": id}
+			if single {
+				for _, field := range []string{"maximum_jpeg", "validation_jpeg", "remote_review", "burst_count"} {
+					if value, exists := req[field]; exists {
+						payload[field] = value
+					}
+				}
+			}
 			if err := a.captureAcrossLinks(payload, cancel, dir); err != nil {
 				select {
 				case <-cancel:
@@ -1329,7 +1490,9 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 			}
 			progress := a.sequence
 			a.mu.Unlock()
-			appendSessionLog(dir, map[string]any{"event": "sequence_progress", "sequence": progress})
+			if !single {
+				appendSessionLog(dir, map[string]any{"event": "sequence_progress", "sequence": progress})
+			}
 			if interval > 0 && i < count-1 {
 				select {
 				case <-time.After(time.Duration(interval) * time.Millisecond):
@@ -1342,7 +1505,12 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 	return nil
 }
 func (a *App) captureAcrossLinks(payload map[string]any, cancel <-chan struct{}, dir string) error {
-	deadline := time.NewTimer(3 * time.Minute)
+	a.mu.RLock()
+	exposure, _ := asInt(a.currentControls["exposure_us"])
+	a.mu.RUnlock()
+	count, _ := asInt(payload["burst_count"])
+	captureTime := time.Duration(exposure) * time.Microsecond * time.Duration(max(1, min(count, 16)))
+	deadline := time.NewTimer(max(3*time.Minute, captureTime+3*time.Minute))
 	defer deadline.Stop()
 	for {
 		if err := a.waitForSequenceLink(cancel, dir); err != nil {
@@ -1351,6 +1519,11 @@ func (a *App) captureAcrossLinks(payload map[string]any, cancel <-chan struct{},
 		a.mu.RLock()
 		changed := a.linkChanged
 		a.mu.RUnlock()
+		select {
+		case <-cancel:
+			return fmt.Errorf("sequence stopped")
+		default:
+		}
 		if response, err := a.command("capture", payload, 5*time.Second); err != nil {
 			if response != nil {
 				return err
@@ -1430,13 +1603,13 @@ func (a *App) fetchAcrossLink(first endpoint, path, dir, sessionDir string) (str
 
 func (a *App) waitForSequenceLink(cancel <-chan struct{}, dir string) error {
 	a.mu.Lock()
+	if a.sequence.Phase == "stopping" {
+		a.mu.Unlock()
+		return fmt.Errorf("sequence stopped")
+	}
 	if a.device.Connected {
 		a.mu.Unlock()
 		return nil
-	}
-	if a.sequence.Message == "Stopped" {
-		a.mu.Unlock()
-		return fmt.Errorf("sequence stopped")
 	}
 	a.sequence.Message = "Waiting for phone"
 	a.mu.Unlock()
@@ -1467,13 +1640,24 @@ func (a *App) waitForSequenceLink(cancel <-chan struct{}, dir string) error {
 	}
 }
 
+func (a *App) videoBusyLocked() bool {
+	return a.video.Recording || a.video.Message == "Starting" || a.video.Message == "Stopping"
+}
+
+func (a *App) captureActivityLocked() string {
+	if a.sequence.Running {
+		return a.sequence.Message
+	}
+	return "video " + strings.ToLower(a.video.Message)
+}
+
 func (a *App) stopSequence() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.sequence.Running && a.sequenceCancel != nil {
 		close(a.sequenceCancel)
 		a.sequenceCancel = nil
-		a.sequence.Message = "Stopped"
+		a.sequence.Phase, a.sequence.Message = "stopping", "Stopping"
 	}
 }
 
@@ -1492,17 +1676,22 @@ func (a *App) routes() http.Handler {
 		_, _ = w.Write(b)
 	})
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, a.snapshot()) })
-	mux.HandleFunc("/api/ui-heartbeat", func(w http.ResponseWriter, r *http.Request) {
-		a.uiSeen.Store(true)
-		a.lastUI.Store(time.Now().UnixNano())
-		writeJSON(w, map[string]any{"ok": true})
+	mux.HandleFunc("GET /api/diagnostics", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		events := append([]diagnosticEvent(nil), a.diagnostics...)
+		heartbeat := a.lastHeartbeat
+		a.mu.RUnlock()
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Disposition", "attachment; filename=TOD_Astro_Diagnostics.json")
+		writeJSON(w, map[string]any{"generated_at": time.Now(), "last_heartbeat": heartbeat, "state": a.snapshot(), "events": events})
 	})
-	mux.HandleFunc("/api/exit", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/exit", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"ok": true})
+		_ = http.NewResponseController(w).Flush()
 		select {
 		case a.quitApp <- struct{}{}:
 		default:
 		}
-		writeJSON(w, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("GET /api/last-jpeg", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
@@ -1524,6 +1713,12 @@ func (a *App) routes() http.Handler {
 	})
 	mux.HandleFunc("/api/preview.jpg", func(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
+		if !a.previewLiveLocked(time.Now()) {
+			a.mu.RUnlock()
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		etag := strconv.Quote(a.frameETag)
 		if len(a.latestFrame) != 0 && r.Header.Get("If-None-Match") == etag {
 			a.mu.RUnlock()
@@ -1646,34 +1841,34 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/api/capture", func(w http.ResponseWriter, r *http.Request) {
 		var p map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&p)
-		resp, err := a.command("capture", p, 5*time.Second)
-		if err != nil {
+		if err := a.runSequence(p, nil, true); err != nil {
 			writeErr(w, err.Error())
 			return
 		}
-		writeJSON(w, resp)
+		writeJSON(w, map[string]any{"ok": true, "status": "starting"})
 	})
 	mux.HandleFunc("/api/video/start", func(w http.ResponseWriter, r *http.Request) {
 		var p map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&p)
-		a.mu.RLock()
-		recording := a.video.Recording
-		a.mu.RUnlock()
-		if recording {
-			writeErr(w, "video is already recording")
+		a.mu.Lock()
+		if a.sequence.Running || a.videoBusyLocked() {
+			activity := a.captureActivityLocked()
+			a.mu.Unlock()
+			writeErr(w, "A capture is "+activity)
 			return
 		}
+		a.video.Message, a.videoTransition = "Starting", time.Now()
+		a.mu.Unlock()
 		resp, err := a.command("start_video", p, 8*time.Second)
 		if err != nil {
+			a.mu.Lock()
+			if a.video.Message == "Starting" {
+				a.video.Message = "Error"
+			}
+			a.mu.Unlock()
 			writeErr(w, err.Error())
 			return
 		}
-		a.mu.Lock()
-		if !a.video.Recording && a.video.Message != "Error" {
-			a.video.Message = "Starting"
-		}
-		a.mu.Unlock()
-
 		writeJSON(w, resp)
 	})
 	mux.HandleFunc("/api/video/stop", func(w http.ResponseWriter, r *http.Request) {
@@ -1683,7 +1878,9 @@ func (a *App) routes() http.Handler {
 			return
 		}
 		a.mu.Lock()
-		a.video.Message = "Stopping"
+		if a.video.Recording {
+			a.video.Message = "Stopping"
+		}
 		a.mu.Unlock()
 		writeJSON(w, resp)
 	})
@@ -1725,7 +1922,7 @@ func (a *App) routes() http.Handler {
 		payload := map[string]any{"target": from.Target, "mode": from.Mode, "frame_type": from.FrameType,
 			"count": from.Requested, "interval_ms": from.IntervalMs, "raw": record.Raw, "jpeg": record.JPEG,
 			"calibration": record.Calibration}
-		if err := a.runSequence(payload, &record); err != nil {
+		if err := a.runSequence(payload, &record, false); err != nil {
 			writeErr(w, err.Error())
 			return
 		}
@@ -1735,9 +1932,18 @@ func (a *App) routes() http.Handler {
 		var p map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&p)
 		a.mu.Lock()
-		if a.sequence.Running || a.video.Recording {
+		if a.sequence.Running || a.videoBusyLocked() {
+			target, _ := p["target"].(string)
+			mode, _ := p["mode"].(string)
+			activity := a.captureActivityLocked()
+			unchanged := (strings.TrimSpace(target) == "" || target == a.session.Target) &&
+				(strings.TrimSpace(mode) == "" || mode == a.session.Mode)
 			a.mu.Unlock()
-			writeErr(w, "A capture run is active")
+			if unchanged {
+				writeJSON(w, map[string]any{"ok": true})
+			} else {
+				writeErr(w, "Cannot change sessions while "+strings.ToLower(activity))
+			}
 			return
 		}
 		if t, ok := p["target"].(string); ok && strings.TrimSpace(t) != "" && t != a.session.Target {
@@ -1825,8 +2031,8 @@ func writeErr(w http.ResponseWriter, s string) {
 	writeJSON(w, map[string]any{"ok": false, "error": s})
 }
 
-func openAppWindow() *exec.Cmd {
-	url := "http://" + httpAddr + "/"
+func openAppWindow(address string) *exec.Cmd {
+	url := "http://" + address + "/"
 	candidates := [][]string{
 		{filepath.Join(os.Getenv("ProgramFiles(x86)"), "Microsoft", "Edge", "Application", "msedge.exe"), "--app=" + url, "--start-maximized"},
 		{filepath.Join(os.Getenv("ProgramFiles"), "Microsoft", "Edge", "Application", "msedge.exe"), "--app=" + url, "--start-maximized"},
@@ -1851,42 +2057,60 @@ func openAppWindow() *exec.Cmd {
 }
 func fileExists(p string) bool { st, e := os.Stat(p); return e == nil && !st.IsDir() }
 
+func runningVersionMatches(address string) bool {
+	client := &http.Client{Timeout: 750 * time.Millisecond}
+	response, err := client.Get("http://" + address + "/api/state")
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	var identity struct {
+		App     string `json:"app"`
+		Version string `json:"version"`
+	}
+	return response.StatusCode == http.StatusOK &&
+		json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&identity) == nil &&
+		identity.App == appName && identity.Version == version
+}
+
 func main() {
 	runtime.LockOSThread()
-	log.SetOutput(io.Discard)
+	listener, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		if runningVersionMatches(httpAddr) {
+			_ = openAppWindow(httpAddr)
+			return
+		}
+		// A legacy instance can still own the fixed port. Its API and dashboard
+		// must not be served as if they belonged to the executable just opened.
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return
+		}
+	}
 	a := newApp()
 	go a.discoveryLoop()
-	srv := &http.Server{Addr: httpAddr, Handler: a.routes(), ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = srv.ListenAndServe() }()
-	time.Sleep(250 * time.Millisecond)
-	_ = openAppWindow()
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-a.stop:
-				return
-			case <-ticker.C:
-				if !a.uiSeen.Load() {
-					continue
-				}
-				last := a.lastUI.Load()
-				if last > 0 && time.Since(time.Unix(0, last)) > 15*time.Second {
-					select {
-					case a.quitApp <- struct{}{}:
-					default:
-					}
-					return
-				}
-			}
-		}
-	}()
+	srv := &http.Server{Handler: a.routes(), ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(listener) }()
+	_ = openAppWindow(listener.Addr().String())
 	<-a.quitApp
 	close(a.stop)
-	a.stopSequence()
-	a.disconnect("")
 	_ = srv.Close()
+	a.stopSequence()
+	a.mu.RLock()
+	finished := a.sequenceFinished
+	videoBusy := a.videoBusyLocked()
+	a.mu.RUnlock()
+	if finished != nil {
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	if videoBusy {
+		_, _ = a.command("stop_video", nil, 2*time.Second)
+	}
+	a.disconnect("")
 	select {
 	case <-a.discoveryDone:
 	case <-time.After(6 * time.Second):

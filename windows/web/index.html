@@ -9,9 +9,10 @@
 <body>
 <div id="app">
   <aside class="sidebar">
-    <div class="brand"><img src="/assets/icon.png"/><div><div class="brand-title"><span>TOD</span> Astro Suite</div><div class="brand-sub">1.0 Engineering RC</div></div></div>
+    <div class="brand"><img src="/assets/icon.png"/><div><div class="brand-title"><span>TOD</span> Astro Suite</div><div class="brand-sub">1.0.1 Stability RC</div></div></div>
     <nav id="nav">
       <button class="nav active" data-mode="Validation / Daylight"><span>◉</span><b>Validation / Daylight</b></button>
+      <button class="nav" data-mode="Capture"><span>▢</span><b>Capture</b></button>
       <button class="nav" data-mode="Planetary"><span>◌</span><b>Planetary</b></button>
       <button class="nav" data-mode="Lunar / Solar"><span>☾</span><b>Lunar / Solar</b></button>
       <button class="nav" data-mode="Deep Sky"><span>✦</span><b>Deep Sky</b></button>
@@ -49,13 +50,18 @@
         <div class="zoom-toolbar quality-toolbar">
           <label for="previewQuality">Preview quality</label>
           <select id="previewQuality"><option value="LOW">Low latency</option><option value="BALANCED" selected>Balanced</option><option value="HIGH">High quality</option></select>
+          <label for="previewRotation">Rotation</label>
+          <select id="previewRotation" disabled><option value="auto">Auto</option><option value="0">0°</option><option value="90">90°</option><option value="180">180°</option><option value="270">270°</option></select>
+          <label><input type="checkbox" id="flipPreviewX" disabled/> Flip H</label>
+          <label><input type="checkbox" id="flipPreviewY" disabled/> Flip V</label>
           <button class="primary" id="validationJpeg">Validation JPEG</button>
           <button class="tool" id="reviewJpeg" disabled>Review saved JPEG</button>
         </div>
         <output id="liveDiagnostics" class="hint live-diagnostics">Camera offline</output>
         <div class="viewer" id="viewer">
           <img id="preview" alt="Live telescope feed"/>
-          <div id="offlineState" class="offline-state"><div class="scope-icon">◉</div><h2>Waiting for TOD Astro Photography</h2><p>Connect the phone with a USB data cable, enable USB debugging, and open TOD Astro Photography.</p><p id="usbHint" role="status"></p><details class="manual-connect"><summary>Manual LAN pairing</summary><input id="manualIp" aria-label="Phone IP" placeholder="Phone IP"/><button id="manualConnectBtn">Connect over LAN</button></details></div>
+          <div id="offlineState" class="offline-state"><div class="scope-icon">◉</div><h2>Waiting for TOD Astro Photography</h2><p>Open TOD Astro Photography on a phone connected to the same network, or connect it by USB.</p><p id="usbHint" role="status"></p><details class="manual-connect"><summary>Manual LAN pairing</summary><input id="manualIp" aria-label="Phone IP" placeholder="Phone IP"/><button id="manualConnectBtn">Connect over LAN</button></details></div>
+          <div id="streamNotice" class="offline-state" role="status" hidden>Waiting for a fresh preview frame…</div>
           <div class="crosshair" id="crosshair"><i></i><i></i><span></span></div>
           <canvas class="analysis-overlay" id="analysisOverlay"></canvas><div class="clip-overlay" id="clipOverlay"></div>
           <div class="viewer-badges"><span id="resBadge">—</span><span id="captureBadge">Capture —</span><span id="fpsBadge">0.0 FPS</span><span id="bitrateBadge">0.0 Mb/s</span></div>
@@ -87,7 +93,12 @@
             <div><span>RAW</span><b>Unknown</b></div><div><span>Manual</span><b>Unknown</b></div><div><span>High speed</span><b>Unknown</b></div><div><span>Burst</span><b>Unknown</b></div>
           </div>
           <details><summary>Camera report</summary><pre id="cameraDetails"></pre></details>
+          <label class="field"><span>Camera</span><select id="cameraSelect" disabled><option>Waiting for phone</option></select></label>
+          <label class="field"><span>Exposure compensation <small id="evStep"></small></span><input type="number" step="1" id="evComp" value="0" disabled/></label>
+          <label class="field"><span>Metering</span><select id="meteringMode" disabled><option value="camera">Camera default</option></select></label>
+          <output class="hint" id="effectiveMetering"></output>
           <div class="section-title">Stabilization / color</div>
+          <p class="hint">Manual white-balance temperature and tint are unavailable. Use the phone’s supported presets.</p>
           <label class="field" hidden><span>White balance</span><select id="awbMode"></select></label>
           <label class="field" id="fixedColorRow" hidden><span>Freeze measured white balance</span><input id="fixedColor" type="checkbox"/></label>
           <label class="field"><span>AE lock</span><input id="aeLock" type="checkbox" /></label>
@@ -114,7 +125,7 @@
             <button class="primary" id="burstBtn" disabled>JPEG burst</button>
           </div>
           <output id="burstReason" class="hint"></output>
-          <button class="danger full" id="stopSeqBtn">Stop sequence</button>
+          <button class="danger full" id="stopSeqBtn">Stop capture</button>
           <div class="progress-card"><div class="progress-head"><b id="seqStatus">Idle</b><span id="seqCount">0 / 0</span></div><div class="progress"><i id="seqBar"></i></div></div>
           <div id="integration" role="status"></div>
           <div id="stackTools" hidden>
@@ -162,13 +173,21 @@
       </aside>
     </section>
 
+    <output id="dashboardNotice" class="dashboard-notice" role="status" hidden></output>
     <footer class="statusbar">
       <div><span class="dot offline" id="footerDot"></span><b id="footerStatus">Waiting for phone</b><span id="footerDetail">Auto-discovery runs in the background.</span></div>
-      <div class="telemetry"><span id="battery">Battery —</span><span id="temp">Temp —</span><span id="storage">Phone storage —</span><span id="pcFolder">Session folder ready</span></div>
+      <div class="telemetry"><span id="battery">Battery —</span><span id="temp">Temp —</span><span id="storage">Phone storage —</span><span id="pcFolder">Session folder ready</span><a href="/api/diagnostics" download>Export diagnostics</a><button class="tool" id="exitDashboard">Exit</button></div>
     </footer>
   </main>
 </div>
 <script defer src="/assets/app.js"></script>
+<dialog id="confirmDashboard">
+  <form method="dialog">
+    <p id="confirmDashboardText"></p>
+    <button class="ghost" value="cancel" autofocus>Cancel</button>
+    <button class="primary" value="continue">Continue</button>
+  </form>
+</dialog>
 <dialog id="jpegReviewDialog">
   <header><strong id="jpegReviewTitle"></strong><button class="ghost" id="closeJpegReview">Close</button></header>
   <img id="jpegReviewImage" alt="Saved native JPEG"/>

@@ -21,3 +21,19 @@ button:disabled { cursor: default; opacity: .55; }
 #jpegReviewDialog::backdrop { background: rgba(0,0,0,.75); }
 #jpegReviewDialog header { display:flex; align-items:center; justify-content:space-between; gap:16px; }
 #jpegReviewImage { display:block; max-width:86vw; max-height:80vh; margin:8px auto 0; object-fit:contain; }
+
+.dashboard-notice {
+  position: fixed;
+  right: 1rem;
+  bottom: 3rem;
+  z-index: 10;
+  max-width: min(36rem, 85vw);
+  padding: .8rem 1rem;
+  border: 1px solid #557197;
+  border-radius: .5rem;
+  background: #16253d;
+  color: #ecf3ff;
+}
+[hidden] { display: none !important; }
+#confirmDashboard { color: #ecf3ff; background: #16253d; border: 1px solid #557197; border-radius: .5rem; }
+.statusbar a { color: #9cbef4; }

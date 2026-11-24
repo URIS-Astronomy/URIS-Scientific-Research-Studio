@@ -24,6 +24,25 @@ class ValidationPolicyTest {
         assertArrayEquals(byteArrayOf(8,7,6,5,4,3,2,1, 22,23,20,21),out)
     }
 
+    @Test fun telescopeFlipsTransformPreviewAndFocusTogether() {
+        val input = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 22, 23)
+        val output = ByteArray(input.size)
+        ValidationPolicy.rotateNv21(input, output, 4, 2, 90, flipX = true)
+        assertArrayEquals(byteArrayOf(1, 5, 2, 6, 3, 7, 4, 8, 20, 21, 22, 23), output)
+        ValidationPolicy.rotateNv21(input, output, 4, 2, 0, flipX = true, flipY = true)
+        assertArrayEquals(byteArrayOf(8, 7, 6, 5, 4, 3, 2, 1, 22, 23, 20, 21), output)
+        assertEquals(ValidationPolicy.Point(.25, .125),
+            ValidationPolicy.sensorPoint(ValidationPolicy.Point(.125, .25), 90, flipX = true))
+        assertEquals(0, ValidationPolicy.rotation(270, 90, front = true))
+    }
+
+    @Test fun thermalProtectionReducesPreviewRateWithoutRaisingLowRates() {
+        assertEquals(20, ValidationPolicy.previewFps(20, 0))
+        assertEquals(12, ValidationPolicy.previewFps(20, 2))
+        assertEquals(6, ValidationPolicy.previewFps(20, 3))
+        assertEquals(4, ValidationPolicy.previewFps(4, 4))
+    }
+
     @Test fun daylightManualStartUsesMeasuredBrightnessWithoutOneSecondExposure() {
         val safe=ValidationPolicy.manualStart(1_000_000_000,1600,10_000,2_000_000_000,50,6400)
         assertEquals(33_333_333L,safe.exposureNs)

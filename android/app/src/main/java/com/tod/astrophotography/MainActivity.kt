@@ -76,6 +76,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             if (exiting) return
             val t = buildTelemetry()
             val camera = cameraController
+            camera?.setThermalStatus(t.optInt("thermal_status"))
             histogram.update(camera?.previewHistogram ?: IntArray(0))
             val measured = camera?.measured()
             val diag = camera?.diagnostics()
@@ -150,10 +151,13 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             override fun capabilities(): JSONObject = cameraController?.capabilities()
                 ?: JSONObject().put("ok", false).put("error", "Camera not ready")
 
-            override fun setControls(payload: JSONObject): JSONObject = cameraController?.setControls(payload)
+            override fun setControls(payload: JSONObject): JSONObject = cameraController?.setRemoteControls(payload)
                 ?: JSONObject().put("ok", false).put("error", "Camera not ready")
 
             override fun capture(payload: JSONObject): JSONObject = cameraController?.capture(payload)
+                ?: JSONObject().put("ok", false).put("error", "Camera not ready")
+
+            override fun cancelCapture(payload: JSONObject): JSONObject = cameraController?.cancelCapture(payload)
                 ?: JSONObject().put("ok", false).put("error", "Camera not ready")
 
             override fun startVideo(payload: JSONObject): JSONObject = cameraController?.startVideo(payload)
@@ -208,12 +212,40 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun showPreviewQuality() {
         val camera = cameraController ?: return
         val presets = com.tod.astrophotography.camera.ValidationPolicy.Preview.entries
-        AlertDialog.Builder(this).setTitle("USB preview quality")
+        AlertDialog.Builder(this).setTitle("Preview quality")
             .setSingleChoiceItems(presets.map { it.label }.toTypedArray(),
                 presets.indexOfFirst { it.name == camera.diagnostics().optString("preview_quality") }) { dialog,index ->
                 showCommandResult(camera.setControls(JSONObject().put("preview_quality",presets[index].name)),"Updating preview stream…")
                 dialog.dismiss()
-            }.setNegativeButton("Cancel",null).show()
+            }.setNeutralButton("Orientation") { _, _ -> showPreviewOrientation(camera) }
+            .setNegativeButton("Cancel",null).show()
+    }
+
+    private fun showPreviewOrientation(camera: CameraController) {
+        val settings = camera.diagnostics().optJSONObject("preview_orientation") ?: JSONObject()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 12, 32, 12)
+        }
+        val angles = listOf(null, 0, 90, 180, 270)
+        val rotation = android.widget.Spinner(this).apply {
+            adapter = android.widget.ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                listOf("Auto", "0°", "90°", "180°", "270°"))
+            setSelection(angles.indexOf(settings.optInt("rotation", -1)).coerceAtLeast(0))
+        }
+        val horizontal = android.widget.CheckBox(this).apply { text = "Flip horizontally"; isChecked = settings.optBoolean("flip_x") }
+        val vertical = android.widget.CheckBox(this).apply { text = "Flip vertically"; isChecked = settings.optBoolean("flip_y") }
+        panel.addView(rotation)
+        panel.addView(horizontal)
+        panel.addView(vertical)
+        AlertDialog.Builder(this).setTitle("Preview orientation").setView(panel)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Apply") { _, _ ->
+                marker?.visibility = android.view.View.GONE
+                val value = JSONObject().put("rotation", angles[rotation.selectedItemPosition] ?: JSONObject.NULL)
+                    .put("flip_x", horizontal.isChecked).put("flip_y", vertical.isChecked)
+                showCommandResult(camera.setControls(JSONObject().put("preview_orientation", value)), "Preview orientation updated")
+            }.show()
     }
 
     private fun showFocusMarker(x: Float,y: Float) {
@@ -304,6 +336,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             activity = this,
             textureView = preview,
             frameSink = { frame -> astroServer?.offerPreviewFrame(frame) },
+            hasPreviewClient = { astroServer?.hasPreviewClient() == true },
             eventSink = { event ->
                 astroServer?.sendEvent(event)
                 when (event.optString("event")) {
@@ -512,7 +545,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val modes = listOf("video_modes" to false, "high_speed_modes" to true).flatMap { (key, highSpeed) ->
             val values = caps.optJSONArray(key)
             (0 until (values?.length() ?: 0)).mapNotNull { i ->
-                Regex("""(\d+)×(\d+) @ (\d+)(?:-\d+)? fps""").matchEntire(values?.optString(i).orEmpty())
+                Regex("""(\d+)×(\d+) @ (\d+)(?:-(\d+))? fps""").matchEntire(values?.optString(i).orEmpty())
                     ?.let { it to highSpeed }
             }
         }
@@ -520,7 +553,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             AlertDialog.Builder(this).setTitle("Video mode")
                 .setItems(modes.map { (match, highSpeed) -> match.value + if (highSpeed) " • High speed" else "" }.toTypedArray()) { _, i ->
                     val (match, highSpeed) = modes[i]
-                    val (_, width, height, fps) = match.groupValues
+                    val (_, width, height, low, high) = match.groupValues
+                    val fps = high.ifEmpty { low }
                     val request = JSONObject().put("width", width.toInt()).put("height", height.toInt())
                         .put("fps", fps.toInt()).put("high_speed", highSpeed)
                     if (highSpeed && camera.controlState().optBoolean("manual_focus")) {

@@ -10,6 +10,7 @@ import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.ServerSocket
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
@@ -25,6 +26,7 @@ class AstroServer(
         fun capabilities(): JSONObject
         fun setControls(payload: JSONObject): JSONObject
         fun capture(payload: JSONObject): JSONObject
+        fun cancelCapture(payload: JSONObject): JSONObject
         fun startVideo(payload: JSONObject): JSONObject
         fun stopVideo(): JSONObject
         fun ping(): JSONObject
@@ -52,7 +54,16 @@ class AstroServer(
         var clientSession: String = ""
     )
     @Volatile private var controlLink: ControlLink? = null
-    private val previewQueue = ArrayBlockingQueue<ByteArray>(1)
+    private data class PreviewFrame(val jpeg: ByteArray, val capturedAt: Long = System.nanoTime())
+    private val previewMonitor = java.lang.Object()
+    private var latestPreview: PreviewFrame? = null
+    @Volatile private var previewClient: Socket? = null
+
+    private fun listen(port: Int): ServerSocket = ServerSocket().apply {
+        reuseAddress = true
+        bind(InetSocketAddress(port))
+        if (!running.get()) close()
+    }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -70,15 +81,22 @@ class AstroServer(
         try { discoverySocket?.close() } catch (_: Exception) {}
         clients.forEach { runCatching { it.close() } }
         controlLink = null
-        previewQueue.clear()
+        synchronized(previewMonitor) {
+            previewClient = null
+            latestPreview = null
+            previewMonitor.notifyAll()
+        }
         connectionListener(null)
     }
 
+    fun hasPreviewClient(): Boolean = previewClient != null
+
     fun offerPreviewFrame(jpeg: ByteArray) {
-        if (!running.get()) return
-        if (!previewQueue.offer(jpeg)) {
-            previewQueue.poll()
-            previewQueue.offer(jpeg)
+        if (jpeg.isEmpty()) return
+        synchronized(previewMonitor) {
+            if (!running.get() || previewClient == null) return
+            latestPreview = PreviewFrame(jpeg)
+            previewMonitor.notifyAll()
         }
     }
 
@@ -106,12 +124,13 @@ class AstroServer(
 
     private fun runControlServer() {
         try {
-            controlServer = ServerSocket(CONTROL_PORT).apply { reuseAddress = true }
+            controlServer = listen(CONTROL_PORT)
             while (running.get()) {
                 val socket = try { controlServer?.accept() } catch (_: Exception) { null } ?: break
                 if (register(socket)) Thread({ handleControlClient(socket) }, "TOD-Control-Client").start()
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
         } finally {
             runCatching { controlServer?.close() }
             connectionListener(null)
@@ -169,7 +188,8 @@ class AstroServer(
                 catch (e: Exception) { JSONObject().put("id", requestId).put("ok", false).put("error", e.message ?: "Invalid command") }
                 enqueue(link, response.toString())
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
         } finally {
             synchronized(this) {
                 if (controlLink === link) {
@@ -194,6 +214,7 @@ class AstroServer(
             "telemetry" -> commandHandler.telemetry()
             "set_controls" -> commandHandler.setControls(payload)
             "capture" -> commandHandler.capture(payload)
+            "cancel_capture" -> commandHandler.cancelCapture(payload)
             "start_video" -> commandHandler.startVideo(payload)
             "stop_video" -> commandHandler.stopVideo()
             else -> JSONObject().put("ok", false).put("error", "Unknown command: $command")
@@ -204,12 +225,27 @@ class AstroServer(
 
     private fun runPreviewServer() {
         try {
-            previewServer = ServerSocket(PREVIEW_PORT).apply { reuseAddress = true }
+            previewServer = listen(PREVIEW_PORT)
             while (running.get()) {
                 val socket = try { previewServer?.accept() } catch (_: Exception) { null } ?: break
-                if (register(socket)) Thread({ handlePreviewClient(socket) }, "TOD-Preview-Client").start()
+                if (!register(socket)) continue
+                val control = controlLink
+                if (control == null || control.socket.inetAddress != socket.inetAddress) {
+                    closeClient(socket)
+                    continue
+                }
+                val previous = synchronized(previewMonitor) {
+                    val retired = previewClient
+                    latestPreview = null
+                    previewClient = socket
+                    previewMonitor.notifyAll()
+                    retired
+                }
+                previous?.let(::closeClient)
+                Thread({ handlePreviewClient(socket) }, "TOD-Preview-Client").start()
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
         } finally { runCatching { previewServer?.close() } }
     }
 
@@ -218,21 +254,39 @@ class AstroServer(
         val output = DataOutputStream(socket.getOutputStream())
         try {
             while (running.get() && !socket.isClosed) {
-                val frame = previewQueue.poll(1, TimeUnit.SECONDS) ?: continue
-                if (frame.isEmpty()) continue
-                output.writeInt(frame.size)
-                output.write(frame)
+                // A retired client must never consume a frame intended for the active socket.
+                val frame = synchronized(previewMonitor) {
+                    while (running.get() && previewClient === socket && latestPreview == null) {
+                        previewMonitor.wait(1000)
+                    }
+                    if (!running.get() || previewClient !== socket) return
+                    latestPreview.also { latestPreview = null }
+                } ?: continue
+                if (System.nanoTime() - frame.capturedAt > TimeUnit.SECONDS.toNanos(1)) continue
+                output.writeInt(frame.jpeg.size)
+                output.write(frame.jpeg)
                 output.flush()
             }
-        } catch (_: Exception) {
-        } finally { closeClient(socket) }
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
+        } finally {
+            synchronized(previewMonitor) {
+                if (previewClient === socket) {
+                    previewClient = null
+                    latestPreview = null
+                }
+            }
+            closeClient(socket)
+        }
     }
 
     private fun runDiscoveryServer() {
         try {
-            discoverySocket = DatagramSocket(DISCOVERY_PORT).apply {
+            discoverySocket = DatagramSocket(null).apply {
                 broadcast = true
                 reuseAddress = true
+                bind(InetSocketAddress(DISCOVERY_PORT))
+                if (!running.get()) close()
                 soTimeout = 1000
             }
             val buffer = ByteArray(1024)
@@ -254,18 +308,20 @@ class AstroServer(
                 } catch (_: java.net.SocketTimeoutException) {
                 } catch (_: Exception) { if (!running.get()) break }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
         } finally { try { discoverySocket?.close() } catch (_: Exception) {}; discoverySocket = null }
     }
 
     private fun runFileServer() {
         try {
-            fileServer = ServerSocket(FILE_PORT).apply { reuseAddress = true }
+            fileServer = listen(FILE_PORT)
             while (running.get()) {
                 val socket = try { fileServer?.accept() } catch (_: Exception) { null } ?: break
                 if (register(socket)) Thread({ handleFileClient(socket) }, "TOD-File-Client").start()
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
         } finally { runCatching { fileServer?.close() } }
     }
 
@@ -289,7 +345,8 @@ class AstroServer(
                 }
             }
             output.flush()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (running.get()) android.util.Log.w("TODNetwork", "Listener or client stopped", e)
         } finally { closeClient(socket) }
     }
 }
