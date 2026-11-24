@@ -17,6 +17,14 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.os.Environment
+import android.os.Build
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
+import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.SessionConfiguration
+import android.graphics.Rect
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Range
@@ -40,7 +48,8 @@ class CameraController(
     private val textureView: TextureView,
     private val frameSink: (ByteArray) -> Unit,
     private val eventSink: (JSONObject) -> Unit,
-    private val statusSink: (String) -> Unit
+    private val statusSink: (String) -> Unit,
+    private val zoomSink: (Double) -> Unit
 ) {
     private val cameraManager = activity.getSystemService(Activity.CAMERA_SERVICE) as CameraManager
     private val cameraThread = HandlerThread("TOD-Camera").apply { start() }
@@ -58,7 +67,25 @@ class CameraController(
     private var previewSurface: Surface? = null
 
     private var previewSize = Size(1280, 720)
-    private var jpegSize = Size(1920, 1080)
+    private lateinit var jpegSize: Size
+    private lateinit var standardJpegSize: Size
+    private var maximumJpegSize: Size? = null
+    private var maximumCapture = false
+    private var mainPhysicalId: String? = null
+    private var cameraInventory = JSONArray()
+    @Volatile private var zoom = 1.0
+    @Volatile private var effective = JSONObject()
+    fun previewZoom(): Double = zoom
+    fun measured(): JSONObject = effective
+    private val lastZoomEvent = AtomicLong(0L)
+    fun updateDisplayZoom(ratio: Double) {
+        zoom = ImagingPolicy.displayZoom(ratio)
+        zoomSink(zoom)
+        val now = System.nanoTime()
+        val previous = lastZoomEvent.get()
+        if (now-previous >= 45_000_000 && lastZoomEvent.compareAndSet(previous,now))
+            eventSink(JSONObject().put("event", "display_zoom").put("ratio",zoom))
+    }
     private var rawSize: Size? = null
     private var hardwareRawSupported = false
     @Volatile private var rawSessionAvailable = false
@@ -76,7 +103,7 @@ class CameraController(
     @Volatile private var recording = false
 
     private var iso = 200
-    private var exposureUs = 10_000L
+    private var exposureTimeNs = 10_000_000L
     private var focusDistance = 0.0f
     private var manualFocus = false
     private var manualEnabled = false
@@ -186,10 +213,9 @@ class CameraController(
         if (map != null) {
             try {
                 val ranges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
-                map.getOutputSizes(MediaCodec::class.java)?.sortedByDescending { it.width.toLong() * it.height }?.filter { it.width <= 3840 && it.height <= 2160 }?.take(12)?.forEach { size ->
+                map.getOutputSizes(MediaCodec::class.java)?.sortedByDescending { it.width.toLong() * it.height }?.forEach { size ->
                     val minDuration = map.getOutputMinFrameDuration(MediaCodec::class.java, size)
-                    ranges.filter { it.lower == it.upper && it.upper <= 60 &&
-                        (minDuration == 0L || minDuration * it.upper <= 1_001_000_000L) && avcEncoder(size.width,size.height,it.upper) != null }.distinct().forEach {
+                    ranges.filter { it.lower == it.upper && ImagingPolicy.standardVideoTiming(it.upper,minDuration) && avcEncoder(size.width,size.height,it.upper) != null }.distinct().forEach {
                         videoModes.put("${size.width}×${size.height} @ ${it.upper} fps")
                     }
                 }
@@ -209,12 +235,20 @@ class CameraController(
         return JSONObject()
             .put("ok", true)
             .put("camera_id", cameraId ?: "")
+            .put("main_physical_id", mainPhysicalId ?: JSONObject.NULL)
+            .put("camera_inventory", cameraInventory)
+            .put("display_zoom_max", ImagingPolicy.MAX_DISPLAY_ZOOM)
+            .put("processing_modes", JSONObject().apply { processingModes(chars).forEach { (key, values) -> put(key, JSONArray(values.toList())) } })
+            .put("capture_settings",controlState())
+            .put("fixed_color_supported",chars?.let(::supportsFixedColor)==true)
             .put("camera_ids", JSONArray(cameraManager.cameraIdList.toList()))
             .put("sensor_width", chars?.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.width ?: 0)
             .put("sensor_height", chars?.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.height ?: 0)
             .put("awb_modes", JSONArray(chars?.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList() ?: emptyList<Int>()))
             .put("preview_width", previewSize.width)
             .put("preview_height", previewSize.height)
+            .put("maximum_jpeg_width",maximumJpegSize?.width ?: 0)
+            .put("maximum_jpeg_height",maximumJpegSize?.height ?: 0)
             .put("jpeg_width", jpegSize.width)
             .put("jpeg_height", jpegSize.height)
             .put("raw_hardware_supported", hardwareRawSupported)
@@ -223,10 +257,10 @@ class CameraController(
             .put("raw_height", rawSize?.height ?: 0)
             .put("iso_min", sensorRange?.lower ?: 0)
             .put("iso_max", sensorRange?.upper ?: 0)
-            .put("exposure_us_min", (exposureRange?.lower ?: 0L) / 1000L)
-            .put("exposure_us_max", (exposureRange?.upper ?: 0L) / 1000L)
+            .put("exposure_us_min", (exposureRange?.lower ?: 0L) / 1000.0)
+            .put("exposure_us_max", (exposureRange?.upper ?: 0L) / 1000.0)
             .put("min_focus_distance", minFocus.toDouble())
-            .put("max_zoom", chars?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0)
+            .put("max_zoom", zoomRange(chars)?.upper?.toDouble() ?: chars?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0)
             .put("manual_sensor", caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR))
             .put("burst_capture", burst)
             .put("high_speed_video", highSpeed)
@@ -246,6 +280,14 @@ class CameraController(
             .put("capability_ids", capabilityArray)
     }
 
+    private data class FixedColor(val gains: RggbChannelVector, val matrix: ColorSpaceTransform)
+    @Volatile private var measuredColor: FixedColor? = null
+    @Volatile private var fixedColor: FixedColor? = null
+    private fun supportsFixedColor(c: CameraCharacteristics): Boolean =
+        c.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.contains(CaptureRequest.CONTROL_AWB_MODE_OFF) == true &&
+        c.availableCaptureRequestKeys.orEmpty().containsAll(listOf(CaptureRequest.COLOR_CORRECTION_MODE,
+            CaptureRequest.COLOR_CORRECTION_GAINS,CaptureRequest.COLOR_CORRECTION_TRANSFORM))
+
     @Volatile private var awbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
 
     fun setControls(payload: JSONObject): JSONObject {
@@ -256,6 +298,23 @@ class CameraController(
 
         val supportsManual = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
             ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        if (payload.has("display_zoom")) {
+            updateDisplayZoom(payload.optDouble("display_zoom", zoom))
+            if (payload.length() == 1) return JSONObject().put("ok",true).put("display_zoom",zoom)
+        }
+        if (payload.has("fixed_color")) {
+            if (payload.optBoolean("fixed_color")) {
+                if (supportsFixedColor(chars)) {
+                    fixedColor = measuredColor ?: return JSONObject().put("ok",false).put("error","Wait for an automatic white-balance measurement")
+                }
+            } else fixedColor = null
+        }
+        val availableKeys = chars.availableCaptureRequestKeys.orEmpty()
+        val modes = processingModes(chars)
+        for ((name, key) in processingRequests) {
+            val value = payload.optInt(name, -1)
+            if (key in availableKeys && modes[name]?.contains(value) == true) processing[name] = value
+        }
         if (payload.has("manual")) manualEnabled = supportsManual && payload.optBoolean("manual")
         if (payload.has("awb_mode")) {
             val requested = payload.optInt("awb_mode", CaptureRequest.CONTROL_AWB_MODE_AUTO)
@@ -264,21 +323,23 @@ class CameraController(
         }
         if (payload.has("iso")) {
             val requested = payload.optInt("iso", iso)
-            iso = if (sensorRange != null) requested.coerceIn(sensorRange.lower, sensorRange.upper) else requested
+            iso = if (sensorRange != null) ImagingPolicy.iso(requested,sensorRange.lower,sensorRange.upper) else requested
         }
         if (payload.has("exposure_us")) {
-            val requestedNs = payload.optLong("exposure_us", exposureUs) * 1000L
-            val clampedNs = if (exposureRange != null) requestedNs.coerceIn(exposureRange.lower, exposureRange.upper) else requestedNs
-            exposureUs = clampedNs / 1000L
+            if (exposureRange != null) {
+                exposureTimeNs = ImagingPolicy.exposureNs(payload.optDouble("exposure_us",exposureTimeNs/1000.0),
+                    exposureTimeNs,exposureRange.lower,exposureRange.upper)
+            }
         }
         if (payload.has("manual_focus")) manualFocus = minFocus > 0 && payload.optBoolean("manual_focus")
         if (payload.has("focus_distance")) {
-            focusDistance = payload.optDouble("focus_distance", focusDistance.toDouble()).toFloat().coerceIn(0f, minFocus)
+            val value = payload.optDouble("focus_distance", focusDistance.toDouble())
+            focusDistance = ImagingPolicy.focus(value,focusDistance,minFocus)
         }
         if (payload.has("ae_lock")) aeLock = payload.optBoolean("ae_lock", aeLock)
         if (payload.has("awb_lock")) awbLock = payload.optBoolean("awb_lock", awbLock)
-        if (payload.has("ois")) oisEnabled = (payload.optBoolean("ois") || payload.optString("ois") == "on") && chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.contains(1) == true
-        if (payload.has("eis")) eisEnabled = (payload.optBoolean("eis") || payload.optString("eis") == "on") && chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.contains(1) == true
+        if (payload.has("ois")) oisEnabled = ImagingPolicy.stabilization(payload.optBoolean("ois") || payload.optString("ois") == "on",chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION))
+        if (payload.has("eis")) eisEnabled = ImagingPolicy.stabilization(payload.optBoolean("eis") || payload.optString("eis") == "on",chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES))
         if (payload.has("roi_percent")) roiPercent = payload.optInt("roi_percent", roiPercent).coerceIn(25, 100)
         cameraHandler.post { applyRepeatingControls() }
         return controlState()
@@ -286,16 +347,17 @@ class CameraController(
 
     fun controlState(): JSONObject = JSONObject().put("ok", true)
             .put("iso", iso)
-            .put("exposure_us", exposureUs)
+            .put("exposure_us", exposureTimeNs/1000.0)
             .put("focus_distance", focusDistance.toDouble())
             .put("manual_focus", manualFocus)
-            .put("awb_mode", awbMode)
+            .put("awb_mode", awbMode).put("fixed_color",fixedColor != null)
             .put("manual", manualEnabled)
             .put("ae_lock", aeLock)
             .put("awb_lock", awbLock)
             .put("ois", oisEnabled)
             .put("eis", eisEnabled)
-            .put("roi_percent", roiPercent)
+            .put("roi_percent", roiPercent).put("display_zoom",zoom)
+            .apply { processing.forEach { (key, value) -> put(key,value) } }
 
     fun isRecording(): Boolean = recording
 
@@ -316,6 +378,10 @@ class CameraController(
             return JSONObject().put("ok", false).put("error", "RAW is not available in this camera session")
         }
         val count = payload.optInt("burst_count", 1)
+        val maximum = payload.optBoolean("maximum_jpeg", false)
+        if (maximum && (maximumJpegSize == null || count != 1 || wantsRaw || !wantsJpeg)) {
+            return JSONObject().put("ok",false).put("error","Maximum sensor mode requires a supported single JPEG capture")
+        }
         if (count !in 1..16 || (count > 1 && (wantsRaw || !capabilities().optBoolean("burst_capture")))) {
             return JSONObject().put("ok", false).put("error", "Native burst requires JPEG, BURST_CAPTURE and 2–16 frames")
         }
@@ -336,15 +402,18 @@ class CameraController(
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
             pendingCapture = PendingCapture(if (captureId.isEmpty()) "TOD_$stamp" else "TOD_$captureId", wantsRaw, captureId, payload.optString("frame_type", "Light"), count, jpegDone = !wantsJpeg, rawDone = !wantsRaw)
         }
-        cameraHandler.post { performStillCapture(wantsRaw, wantsJpeg, count) }
+        cameraHandler.post {
+            if (maximum && Build.VERSION.SDK_INT >= 31) captureMaximumJpeg()
+            else performStillCapture(wantsRaw,wantsJpeg,count)
+        }
         return JSONObject().put("ok", true).put("status", "capture_started").put("raw", wantsRaw)
     }
 
     fun startVideo(payload: JSONObject): JSONObject {
         if (recording || videoEncoder != null) return JSONObject().put("ok", false).put("error", "Video is already recording or starting")
         if (cameraDevice == null) return JSONObject().put("ok", false).put("error", "Camera not ready")
-        val width = payload.optInt("width", 1920).coerceAtLeast(320)
-        val height = payload.optInt("height", 1080).coerceAtLeast(240)
+        val width = payload.optInt("width", 1920).coerceAtLeast(1)
+        val height = payload.optInt("height", 1080).coerceAtLeast(1)
         val fps = payload.optInt("fps", 30).coerceIn(1, 1000)
         val highSpeed = payload.optBoolean("high_speed", false)
         val durationMs = payload.optLong("duration", 0).coerceIn(0, 86_400) * 1000
@@ -386,7 +455,7 @@ class CameraController(
         } else {
             require(map.getOutputSizes(MediaCodec::class.java)?.contains(size) == true &&
                 chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.contains(range) == true &&
-                fps <= 60 && map.getOutputMinFrameDuration(MediaCodec::class.java, size) * fps <= 1_001_000_000L) {
+                ImagingPolicy.standardVideoTiming(fps,map.getOutputMinFrameDuration(MediaCodec::class.java, size))) {
                 "Unsupported video resolution or FPS"
             }
         }
@@ -434,6 +503,7 @@ class CameraController(
             }
             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 if (!recording || videoEncoder !== recorder) return
+                readEffective(result)
                 result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP)?.let {
                     cameraTimes.add(it / 1000, result.frameNumber)
                 }
@@ -466,7 +536,7 @@ class CameraController(
                         val requests = captureSession.createHighSpeedRequestList(builder.build())
                         captureSession.setRepeatingBurst(requests, counters, cameraHandler)
                     } else {
-                        applyControls(builder)
+                        applyControls(builder, captureROI = true, videoFPS = fps)
                         captureSession.setRepeatingRequest(builder.build(), counters, cameraHandler)
                     }
                     recorder.start()
@@ -548,34 +618,167 @@ class CameraController(
     }
 
     private fun chooseCamera() {
-        var bestId: String? = null
-        var bestArea = -1L
-        var bestChars: CameraCharacteristics? = null
-        cameraManager.cameraIdList.forEach { id ->
-            val chars = cameraManager.getCameraCharacteristics(id)
-            if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) return@forEach
-            val pixel = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
-            val area = if (pixel != null) pixel.width.toLong() * pixel.height.toLong() else 0L
-            if (area > bestArea) {
-                bestArea = area
-                bestId = id
-                bestChars = chars
+        val accessible = cameraManager.cameraIdList.associateWith { cameraManager.getCameraCharacteristics(it) }
+        val inventory = accessible.toMutableMap()
+        accessible.values.flatMap { it.physicalCameraIds }.distinct().forEach { id ->
+            if (id !in inventory) runCatching { cameraManager.getCameraCharacteristics(id) }.getOrNull()?.let { inventory[id] = it }
+        }
+        fun lens(id: String, c: CameraCharacteristics): RearLens {
+            val active = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            val sensor = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES).orEmptyInts()
+            return RearLens(id,(active?.width()?.toLong() ?: 0L)*(active?.height() ?: 0),
+                c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()?.toDouble() ?: 0.0,
+                sensor?.width?.toDouble() ?: 0.0,sensor?.height?.toDouble() ?: 0.0,
+                c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.contains(1) == true,
+                caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW),
+                caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR))
+        }
+        val rear = accessible.filterValues { it.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
+        val representatives = rear.mapValues { (id, c) ->
+            ImagingPolicy.chooseMain(c.physicalCameraIds.mapNotNull { child -> inventory[child]?.let { lens(child,it) } }) ?: lens(id,c)
+        }
+        val best = ImagingPolicy.chooseMain(representatives.values.toList()) ?: error("No usable rear camera")
+        val id = representatives.entries.filter { it.value.id == best.id }
+            .maxWithOrNull(compareBy<Map.Entry<String, RearLens>> {
+                accessible.getValue(it.key).get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                    ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+            }.thenBy { it.key == best.id })!!.key
+        val selected = accessible.getValue(id)
+        mainPhysicalId = best.id.takeIf { it != id || inventory.values.any { c -> it in c.physicalCameraIds } }
+        cameraInventory = JSONArray().apply {
+            inventory.forEach { (entry, c) -> put(describeCamera(entry,c,entry in accessible,lens(entry,c))) }
+            accessible.values.flatMap { it.physicalCameraIds }.distinct().filterNot { it in inventory }.forEach {
+                put(JSONObject().put("id",it).put("metadata_available",false))
             }
         }
-        cameraId = bestId ?: cameraManager.cameraIdList.firstOrNull()
-            ?: throw IllegalStateException("No camera found")
-        characteristics = bestChars ?: cameraManager.getCameraCharacteristics(cameraId!!)
-
-        val map = characteristics!!.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?: throw IllegalStateException("No stream configuration map")
+        val map = selected.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: error("No stream map")
         previewSize = choosePreviewSize(map.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty())
-        jpegSize = map.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height } ?: Size(1920, 1080)
-        val caps = characteristics!!.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
-        hardwareRawSupported = caps.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
-        rawSize = if (hardwareRawSupported) {
-            map.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
-        } else null
-        statusSink("Camera ${cameraId} • Preview ${previewSize.width}×${previewSize.height} • JPEG ${jpegSize.width}×${jpegSize.height}")
+        standardJpegSize = ImagingPolicy.largestSize(map.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty(),Size::getWidth,Size::getHeight)
+            ?: error("No native JPEG output")
+        jpegSize = ImagingPolicy.largestSize(map.getHighResolutionOutputSizes(ImageFormat.JPEG)?.toList().orEmpty() + standardJpegSize, Size::getWidth,Size::getHeight)!!
+        maximumJpegSize = maximumJpeg(selected)
+        hardwareRawSupported = selected.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+        rawSize = if (hardwareRawSupported) ImagingPolicy.largestSize(map.getOutputSizes(ImageFormat.RAW_SENSOR)?.toList().orEmpty(), Size::getWidth,Size::getHeight) else null
+        cameraId = id
+        characteristics = selected
+        setControls(JSONObject().put("iso",iso).put("exposure_us",exposureTimeNs/1000.0))
+        statusSink("Rear camera $id • Preview ${previewSize.width}×${previewSize.height} • JPEG ${jpegSize.width}×${jpegSize.height}")
+    }
+
+    private fun describeCamera(id: String, c: CameraCharacteristics, openable: Boolean, lens: RearLens): JSONObject {
+        val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        fun sizes(format: Int) = JSONArray((map?.getOutputSizes(format)?.toList().orEmpty() +
+            map?.getHighResolutionOutputSizes(format)?.toList().orEmpty()).distinct()
+            .sortedByDescending { it.width.toLong()*it.height }.map { it.toString() })
+        val highSpeed = JSONArray()
+        runCatching { map?.highSpeedVideoSizes?.forEach { sz ->
+            map.getHighSpeedVideoFpsRangesFor(sz).forEach { highSpeed.put("$sz @ ${it.lower}–${it.upper} fps") }
+        } }
+        val ratio = zoomRange(c)
+        return JSONObject().put("id",id).put("openable",openable).put("facing",c.get(CameraCharacteristics.LENS_FACING))
+            .put("physical_ids",JSONArray(c.physicalCameraIds.toList()))
+            .put("active_array",c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.flattenToString())
+            .put("pixel_array",c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.toString())
+            .put("focal_lengths_mm",JSONArray(c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.toList().orEmpty()))
+            .put("apertures",JSONArray(c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.toList().orEmpty()))
+            .put("estimated_equivalent_mm",lens.equivalentMm ?: JSONObject.NULL)
+            .put("raw",lens.raw).put("manual",lens.manual)
+            .put("maximum_pixel_array", if (Build.VERSION.SDK_INT >= 31) c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION)?.toString() else null)
+            .put("maximum_jpeg", maximumJpeg(c)?.toString())
+            .put("jpeg_sizes",sizes(ImageFormat.JPEG)).put("raw_sizes",sizes(ImageFormat.RAW_SENSOR))
+            .put("yuv_sizes",sizes(ImageFormat.YUV_420_888))
+            .put("video_sizes",JSONArray(map?.getOutputSizes(MediaCodec::class.java)?.map { it.toString() }.orEmpty()))
+            .put("fps_ranges",JSONArray(c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.map { it.toString() }.orEmpty()))
+            .put("high_speed_modes",highSpeed)
+            .put("zoom_ratio_range",ratio?.let { JSONArray(listOf(it.lower,it.upper)) } ?: JSONObject.NULL)
+            .put("max_digital_zoom",c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM))
+            .put("crop_type",c.get(CameraCharacteristics.SCALER_CROPPING_TYPE)?.let {
+                if (it == CameraCharacteristics.SCALER_CROPPING_TYPE_FREEFORM) "freeform" else "center_only"
+            })
+            .put("ois_modes",JSONArray(c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.toList().orEmpty()))
+            .put("eis_modes",JSONArray(c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.toList().orEmpty()))
+    }
+
+    private fun IntArray?.orEmptyInts() = this ?: intArrayOf()
+
+    private fun zoomRange(c: CameraCharacteristics?): Range<Float>? =
+        if (Build.VERSION.SDK_INT >= 30 && c?.availableCaptureRequestKeys?.contains(CaptureRequest.CONTROL_ZOOM_RATIO) == true)
+            c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) else null
+
+    private fun maximumJpeg(c: CameraCharacteristics): Size? {
+        if (Build.VERSION.SDK_INT < 31 ||
+            c.availableCaptureRequestKeys?.contains(CaptureRequest.SENSOR_PIXEL_MODE) != true ||
+            c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR
+            ) != true) return null
+        val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION) ?: return null
+        return ImagingPolicy.largestSize(map.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty() +
+            map.getHighResolutionOutputSizes(ImageFormat.JPEG)?.toList().orEmpty(),Size::getWidth,Size::getHeight)
+    }
+
+    @android.annotation.TargetApi(31)
+    private fun captureMaximumJpeg() {
+        val camera = cameraDevice ?: return failPending("Camera unavailable")
+        val size = maximumJpegSize ?: return failPending("Maximum JPEG is not available")
+        maximumCapture = true
+        try {
+            session?.close()
+            session = null
+            repeatingBuilder = null
+            previewReader?.close(); previewReader = null
+            rawReader?.close(); rawReader = null
+            jpegReader?.close()
+            jpegReader = ImageReader.newInstance(size.width,size.height,ImageFormat.JPEG,2).apply {
+                setOnImageAvailableListener({ reader ->
+                    val image = reader.acquireNextImage() ?: return@setOnImageAvailableListener
+                    try { image.use(::saveJpeg) }
+                    catch (e: Exception) { failPending("Maximum JPEG save failed: ${e.message}") }
+                },cameraHandler)
+            }
+            val target = jpegReader!!.surface
+            val output = OutputConfiguration(target).apply {
+                addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+            }
+            val callback = object: CameraCaptureSession.StateCallback() {
+                override fun onConfigured(configured: CameraCaptureSession) {
+                    if (!started || !maximumCapture) { configured.close(); return }
+                    session = configured
+                    try {
+                        val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                        applyControls(request, maximumSensor = true)
+                        request.set(CaptureRequest.JPEG_QUALITY,100.toByte())
+                        request.set(CaptureRequest.SENSOR_PIXEL_MODE,CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                        request.addTarget(target)
+                        configured.capture(request.build(),object: CameraCaptureSession.CaptureCallback() {
+                            override fun onCaptureFailed(captureSession: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                                if (maximumCapture && session === captureSession) failPending("Maximum JPEG capture failed")
+                            }
+                            override fun onCaptureBufferLost(captureSession: CameraCaptureSession, request: CaptureRequest, surface: Surface, frameNumber: Long) {
+                                if (maximumCapture && session === captureSession) failPending("Maximum JPEG output was lost")
+                            }
+                        },cameraHandler)
+                    } catch (e: Exception) { failPending("Maximum JPEG request failed: ${e.message}") }
+                }
+                override fun onConfigureFailed(configured: CameraCaptureSession) {
+                    configured.close()
+                    if (maximumCapture) failPending("Camera rejected the maximum JPEG stream")
+                }
+            }
+            camera.createCaptureSession(SessionConfiguration(SessionConfiguration.SESSION_REGULAR,listOf(output),
+                { command -> cameraHandler.post(command) },callback))
+            val capture = synchronized(captureLock) { pendingCapture }
+            cameraHandler.postDelayed({
+                if (maximumCapture && synchronized(captureLock) { pendingCapture === capture }) failPending("Maximum JPEG timed out")
+            },maxOf(15_000L,exposureTimeNs/1_000_000L+8_000L))
+        } catch (e: Exception) { failPending("Maximum JPEG unavailable: ${e.message}") }
+    }
+
+    private fun restoreAfterMaximum() {
+        if (!maximumCapture) return
+        maximumCapture = false
+        cameraHandler.post { if (started && cameraDevice != null) configureReadersAndSession(hardwareRawSupported && rawSize != null) }
     }
 
     private fun choosePreviewSize(sizes: List<Size>): Size {
@@ -695,11 +898,16 @@ class CameraController(
                 rawSessionAvailable = rawReader != null
                 startRepeating()
                 statusSink("Camera ready • PC live stream active")
+                eventSink(JSONObject().put("event","camera_changed"))
             }
 
             override fun onConfigureFailed(captureSession: CameraCaptureSession) {
                 captureSession.close()
-                if (includeRaw) {
+                if (jpegSize != standardJpegSize) {
+                    jpegSize = standardJpegSize
+                    statusSink("Largest JPEG stream cannot coexist with this preview; using standard native JPEG")
+                    configureReadersAndSession(includeRaw)
+                } else if (includeRaw) {
                     rawSessionAvailable = false
                     statusSink("RAW stream combination unsupported; retrying JPEG mode")
                     configureReadersAndSession(includeRaw = false)
@@ -718,7 +926,7 @@ class CameraController(
         previewReader?.surface?.let(builder::addTarget)
         repeatingBuilder = builder
         applyControls(builder)
-        captureSession.setRepeatingRequest(builder.build(), null, cameraHandler)
+        captureSession.setRepeatingRequest(builder.build(), effectiveCallback, cameraHandler)
     }
 
     private fun applyRepeatingControls() {
@@ -726,18 +934,66 @@ class CameraController(
         val captureSession = session ?: return
         try {
             applyControls(builder)
-            captureSession.setRepeatingRequest(builder.build(), null, cameraHandler)
+            captureSession.setRepeatingRequest(builder.build(), effectiveCallback, cameraHandler)
         } catch (e: Exception) {
             statusSink("Control update error: ${e.message}")
         }
     }
 
-    private fun applyControls(builder: CaptureRequest.Builder) {
+    private val processing = java.util.concurrent.ConcurrentHashMap<String,Int>()
+    private val processingRequests = mapOf(
+        "noise_reduction" to CaptureRequest.NOISE_REDUCTION_MODE, "edge" to CaptureRequest.EDGE_MODE,
+        "hot_pixel" to CaptureRequest.HOT_PIXEL_MODE, "tonemap" to CaptureRequest.TONEMAP_MODE,
+        "aberration" to CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE
+    )
+    private fun processingModes(c: CameraCharacteristics?): Map<String,IntArray> {
+        if (c == null) return emptyMap()
+        return mapOf(
+            "noise_reduction" to c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES),
+            "edge" to c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES),
+            "hot_pixel" to c.get(CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES),
+            "tonemap" to c.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)?.filter { it == 1 || it == 2 }?.toIntArray(),
+            "aberration" to c.get(CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES)
+        ).mapNotNull { (name, values) ->
+            if (values == null || processingRequests[name] !in c.availableCaptureRequestKeys.orEmpty()) null else name to values
+        }.toMap()
+    }
+
+    private var lastMeasured = 0L
+    private fun readEffective(result: TotalCaptureResult) {
+        val now = System.nanoTime()
+        if (now-lastMeasured < 200_000_000L) return
+        lastMeasured = now
+        if (fixedColor == null && result.get(CaptureResult.CONTROL_AWB_MODE) == CaptureRequest.CONTROL_AWB_MODE_AUTO) {
+            val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+            val matrix = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+            if (gains != null && matrix != null) measuredColor = FixedColor(gains,matrix)
+        }
+        effective = JSONObject().put("fixed_color_ready",measuredColor != null)
+            .put("iso",result.get(CaptureResult.SENSOR_SENSITIVITY) ?: JSONObject.NULL)
+            .put("exposure_us",result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1000.0) ?: JSONObject.NULL)
+            .put("focus_distance",result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: JSONObject.NULL)
+            .put("ois",result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE) ?: JSONObject.NULL)
+            .put("eis",result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE) ?: JSONObject.NULL)
+            .apply { if (Build.VERSION.SDK_INT >= 29) put("active_physical_id",result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) ?: JSONObject.NULL) }
+    }
+
+    private val effectiveCallback = object: CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) = readEffective(result)
+    }
+
+    private fun applyControls(builder: CaptureRequest.Builder, captureROI: Boolean = false, videoFPS: Int = 0, maximumSensor: Boolean = false) {
         if (manualEnabled) {
             builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
-            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureUs * 1000L)
+            val shutter = exposureTimeNs
+            val period = if (videoFPS > 0) 1_000_000_000L / videoFPS else 0L
+            val minimum = characteristics?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.lower ?: 1L
+            val effectiveShutter = if (period > 0) shutter.coerceAtMost(period).coerceAtLeast(minimum) else shutter
+            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,effectiveShutter)
+            if (period > 0 && characteristics?.availableCaptureRequestKeys?.contains(CaptureRequest.SENSOR_FRAME_DURATION)==true)
+                builder.set(CaptureRequest.SENSOR_FRAME_DURATION,maxOf(period,effectiveShutter))
         } else {
             builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -752,21 +1008,30 @@ class CameraController(
         } else if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO)) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
         }
-        builder.set(CaptureRequest.CONTROL_AWB_MODE, awbMode)
-        try {
-            val active = characteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            if (active != null && roiPercent < 100) {
-                val zoom = characteristics?.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
-                val scale = maxOf(roiPercent / 100.0, 1.0 / zoom)
-                val w = (active.width() * scale).toInt().coerceAtLeast(64)
-                val h = (active.height() * scale).toInt().coerceAtLeast(64)
-                val left = active.centerX() - w / 2
-                val top = active.centerY() - h / 2
-                builder.set(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(left, top, left + w, top + h))
-            } else if (active != null) {
-                builder.set(CaptureRequest.SCALER_CROP_REGION, active)
+        val color = fixedColor
+        if (color != null) {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE,CaptureRequest.CONTROL_AWB_MODE_OFF)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE,CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS,color.gains)
+            builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM,color.matrix)
+        } else {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE,awbMode)
+            if (chars?.let(::supportsFixedColor)==true) builder.set(CaptureRequest.COLOR_CORRECTION_MODE,CaptureRequest.COLOR_CORRECTION_MODE_FAST)
+        }
+        val active = if (maximumSensor && Build.VERSION.SDK_INT >= 31) chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE_MAXIMUM_RESOLUTION)
+            else chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        if (active != null && chars != null) {
+            val range = zoomRange(chars)
+            val framing = ImagingPolicy.captureFraming(Crop(active.left,active.top,active.right,active.bottom),roiPercent,
+                chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)?.toDouble() ?: 1.0,
+                range?.upper?.toDouble(),captureROI)
+            if (Build.VERSION.SDK_INT >= 30 && range != null) {
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO,framing.ratio.toFloat().coerceIn(range.lower,range.upper))
             }
-        } catch (_: Exception) {}
+            val region = framing.crop
+            builder.set(CaptureRequest.SCALER_CROP_REGION,Rect(region.left,region.top,region.right,region.bottom))
+        }
+        processing.forEach { (name,value) -> processingRequests[name]?.let { builder.set(it,value) } }
         try { builder.set(CaptureRequest.CONTROL_AE_LOCK, aeLock) } catch (_: Exception) {}
         try { builder.set(CaptureRequest.CONTROL_AWB_LOCK, awbLock) } catch (_: Exception) {}
         try { builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, if (eisEnabled) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF) } catch (_: Exception) {}
@@ -781,7 +1046,10 @@ class CameraController(
             if (wantsJpeg) jpegReader?.surface?.let(builder::addTarget)
             if (wantsRaw) rawReader?.surface?.let(builder::addTarget)
             applyControls(builder)
-            builder.set(CaptureRequest.JPEG_ORIENTATION, 0)
+            if (wantsJpeg) {
+                builder.set(CaptureRequest.JPEG_QUALITY,100.toByte())
+                builder.set(CaptureRequest.JPEG_ORIENTATION,0)
+            }
             val request = builder.build()
             val callback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
@@ -888,6 +1156,7 @@ class CameraController(
             }
             synchronized(captureLock) { if (pendingCapture === done) pendingCapture = null }
             eventSink(event)
+            restoreAfterMaximum()
         }
     }
 
@@ -906,6 +1175,7 @@ class CameraController(
         }
         eventSink(JSONObject().put("event", "capture_error").put("message", message)
             .put("capture_id", pending?.captureId ?: ""))
+        restoreAfterMaximum()
     }
 
     private fun sampleHistogram(image: Image): IntArray {

@@ -128,3 +128,20 @@ func TestInterruptedJournalRestoresProgress(t *testing.T) {
 		t.Fatal("accepted traversal")
 	}
 }
+
+func TestSelectedFocusAreaUsesNativePreviewCoordinates(t *testing.T) {
+	img := image.NewGray(image.Rect(10, 20, 410, 320))
+	center := focusPosition(img.Bounds(), &FocusPoint{X: .8, Y: .7})
+	for y := center.Y - 10; y <= center.Y+10; y++ {
+		for x := center.X - 10; x <= center.X+10; x++ {
+			dx, dy := float64(x-center.X), float64(y-center.Y)
+			img.SetGray(x, y, color.Gray{Y: byte(190 * math.Exp(-(dx*dx+dy*dy)/8))})
+		}
+	}
+	if stellarFocus(img) != nil {
+		t.Fatal("center focus should not find the off-axis star")
+	}
+	if got := stellarFocusAt(img, center); got == nil || got.FWHM < 3 || got.FWHM > 5 {
+		t.Fatalf("off-axis star measurement = %+v", got)
+	}
+}

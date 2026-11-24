@@ -8,5 +8,8 @@
 #sessionsPanel { padding: 1rem; min-height: 14rem; }
 #sessionsPanel output, #videoReview { display: block; margin: .35rem 0 .75rem; color: #aebfd9; }
 #savedSessions { max-width: 100%; }
-.viewer.focus-zoom #preview, .viewer.focus-zoom #analysisOverlay { transform: scale(2.5); }
+#preview { transform: scale(var(--preview-zoom, 1)); }
+.zoom-toolbar { display:flex; gap:10px; align-items:center; padding:6px 12px; color:var(--muted); font-size:12px; }
+.zoom-toolbar input { flex:1; min-width:75px; }
+.zoom-toolbar output { color:var(--text); min-width:3.2em; font-variant-numeric:tabular-nums; }
 button:disabled { cursor: default; opacity: .55; }

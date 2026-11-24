@@ -12,12 +12,18 @@
         <TextView android:id="@+id/connection" android:maxWidth="132dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/pill" android:text="PC OFFLINE" android:textColor="@color/amber" android:textStyle="bold" android:textSize="10sp" />
     </LinearLayout>
 
-    <FrameLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:background="@drawable/panel" android:padding="4dp">
+    <FrameLayout android:id="@+id/previewFrame" android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:background="@drawable/panel" android:padding="4dp">
         <TextureView android:id="@+id/preview" android:layout_width="match_parent" android:layout_height="match_parent" />
         <View android:layout_width="1dp" android:layout_height="match_parent" android:layout_gravity="center_horizontal" android:background="#55FFFFFF" android:layout_marginTop="38dp" android:layout_marginBottom="38dp" />
         <View android:layout_width="match_parent" android:layout_height="1dp" android:layout_gravity="center_vertical" android:background="#55FFFFFF" android:layout_marginLeft="38dp" android:layout_marginRight="38dp" />
         <TextView android:id="@+id/cameraBadge" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_gravity="left|bottom" android:layout_margin="8dp" android:background="@drawable/pill" android:text="Camera starting…" android:textColor="@color/text" android:textSize="10sp" />
     </FrameLayout>
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical">
+        <TextView android:id="@+id/zoomLabel" android:layout_width="94dp" android:layout_height="wrap_content"
+            android:text="Display 1.0×" android:textColor="@color/text" android:textSize="12sp" />
+        <SeekBar android:id="@+id/displayZoom" android:layout_width="0dp" android:layout_weight="1"
+            android:layout_height="48dp" android:max="700" android:contentDescription="Display zoom" />
+    </LinearLayout>
     <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
         android:orientation="vertical" android:paddingTop="5dp">
         <TextView android:id="@+id/previewFrames" android:layout_width="match_parent"

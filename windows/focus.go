@@ -12,8 +12,23 @@ type StellarFocus struct {
 }
 
 func stellarFocus(img image.Image) *StellarFocus {
+	return stellarFocusAt(img, focusPosition(img.Bounds(), nil))
+}
+
+type FocusPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+func focusPosition(bounds image.Rectangle, point *FocusPoint) image.Point {
+	if point == nil {
+		return image.Pt((bounds.Min.X+bounds.Max.X)/2, (bounds.Min.Y+bounds.Max.Y)/2)
+	}
+	return image.Pt(bounds.Min.X+int(point.X*float64(bounds.Dx()-1)), bounds.Min.Y+int(point.Y*float64(bounds.Dy()-1)))
+}
+
+func stellarFocusAt(img image.Image, center image.Point) *StellarFocus {
 	b := img.Bounds()
-	center := image.Pt((b.Min.X+b.Max.X)/2, (b.Min.Y+b.Max.Y)/2)
 	roi := image.Rect(center.X-48, center.Y-48, center.X+48, center.Y+48).Intersect(b)
 	const radius = 9
 	gray := func(x, y int) float64 {

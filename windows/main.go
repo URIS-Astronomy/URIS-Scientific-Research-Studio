@@ -107,14 +107,15 @@ type SessionState struct {
 }
 
 type StateSnapshot struct {
-	App      string        `json:"app"`
-	Version  string        `json:"version"`
-	Device   DeviceState   `json:"device"`
-	Metrics  Metrics       `json:"metrics"`
-	Video    VideoState    `json:"video"`
-	Sequence SequenceState `json:"sequence"`
-	Session  SessionState  `json:"session"`
-	Stack    StackStats    `json:"stack"`
+	FocusPoint *FocusPoint   `json:"focus_point,omitempty"`
+	App        string        `json:"app"`
+	Version    string        `json:"version"`
+	Device     DeviceState   `json:"device"`
+	Metrics    Metrics       `json:"metrics"`
+	Video      VideoState    `json:"video"`
+	Sequence   SequenceState `json:"sequence"`
+	Session    SessionState  `json:"session"`
+	Stack      StackStats    `json:"stack"`
 }
 
 type controlResponse struct {
@@ -129,6 +130,7 @@ type captureResult struct {
 }
 
 type App struct {
+	focusPoint       *FocusPoint
 	active           endpoint
 	phoneID          string
 	clientSession    string
@@ -232,7 +234,7 @@ func (a *App) snapshot() StateSnapshot {
 	if a.stack != nil {
 		stack = a.stack.snapshot()
 	}
-	return StateSnapshot{Stack: stack, App: appName, Version: version, Device: d, Metrics: a.metrics, Video: a.video, Sequence: a.sequence, Session: s}
+	return StateSnapshot{FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: a.metrics, Video: a.video, Sequence: a.sequence, Session: s}
 }
 func cloneMap(src map[string]any) map[string]any {
 	out := map[string]any{}
@@ -608,6 +610,15 @@ func (a *App) scanControl(c net.Conn, r io.Reader) {
 func (a *App) handleEvent(m map[string]any) {
 	ev := fmt.Sprint(m["event"])
 	switch ev {
+	case "camera_changed":
+		a.mu.Lock()
+		a.device.Capabilities = map[string]any{}
+		a.mu.Unlock()
+	case "display_zoom":
+		a.mu.Lock()
+		a.device.Telemetry = cloneMap(a.device.Telemetry)
+		a.device.Telemetry["display_zoom"] = m["ratio"]
+		a.mu.Unlock()
 	case "telemetry":
 		a.mu.Lock()
 		a.device.Telemetry = m
@@ -901,8 +912,16 @@ func (a *App) analyzeFrame(b []byte) {
 			sum += uint64(l)
 		}
 	}
-	for y := step; y < h-step; y += step * 2 {
-		for x := step; x < w-step; x += step * 2 {
+	a.mu.RLock()
+	point := a.focusPoint
+	a.mu.RUnlock()
+	center := focusPosition(bounds, point)
+	region := bounds
+	if point != nil {
+		region = image.Rect(center.X-48, center.Y-48, center.X+48, center.Y+48).Intersect(bounds)
+	}
+	for y := region.Min.Y - bounds.Min.Y + step; y < region.Max.Y-bounds.Min.Y-step; y += step * 2 {
+		for x := region.Min.X - bounds.Min.X + step; x < region.Max.X-bounds.Min.X-step; x += step * 2 {
 			c := lumAt(x, y)
 			lap := 4*c - lumAt(x-step, y) - lumAt(x+step, y) - lumAt(x, y-step) - lumAt(x, y+step)
 			if lap < 0 {
@@ -928,7 +947,7 @@ func (a *App) analyzeFrame(b []byte) {
 	for i := 253; i < 256; i++ {
 		high += hist[i]
 	}
-	m := Metrics{Histogram: hist, Star: stellarFocus(img)}
+	m := Metrics{Histogram: hist, Star: stellarFocusAt(img, center)}
 	if total > 0 {
 		m.Mean = float64(sum) / float64(total)
 		m.Median = median
@@ -939,6 +958,10 @@ func (a *App) analyzeFrame(b []byte) {
 		m.FocusScore = focus / float64(focusN)
 	}
 	a.mu.Lock()
+	if a.focusPoint != point {
+		a.mu.Unlock()
+		return
+	}
 	m.FocusHistory = append(append([]float64(nil), a.metrics.FocusHistory...), m.FocusScore)
 	if len(m.FocusHistory) > 90 {
 		m.FocusHistory = m.FocusHistory[1:]
@@ -1506,6 +1529,40 @@ func (a *App) routes() http.Handler {
 		default:
 		}
 		writeJSON(w, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("POST /api/focus-roi", func(w http.ResponseWriter, r *http.Request) {
+		var point *FocusPoint
+		if json.NewDecoder(r.Body).Decode(&point) != nil || (point != nil && (point.X < 0 || point.X > 1 || point.Y < 0 || point.Y > 1)) {
+			writeErr(w, "Invalid focus location")
+			return
+		}
+		a.mu.Lock()
+		a.focusPoint = point
+		a.metrics.FocusHistory = nil
+		a.metrics.Star = nil
+		a.mu.Unlock()
+		writeJSON(w, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("POST /api/display-zoom", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Ratio float64 `json:"ratio"`
+		}
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Ratio < 1 || request.Ratio > 8 {
+			writeErr(w, "Invalid display zoom")
+			return
+		}
+		response, err := a.command("set_controls", map[string]any{"display_zoom": request.Ratio}, 4*time.Second)
+		if err != nil {
+			writeErr(w, err.Error())
+			return
+		}
+		if ratio, ok := response["display_zoom"].(float64); ok {
+			a.mu.Lock()
+			a.device.Telemetry = cloneMap(a.device.Telemetry)
+			a.device.Telemetry["display_zoom"] = ratio
+			a.mu.Unlock()
+		}
+		writeJSON(w, response)
 	})
 	mux.HandleFunc("/api/controls", func(w http.ResponseWriter, r *http.Request) {
 		var p map[string]any

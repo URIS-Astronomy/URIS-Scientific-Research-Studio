@@ -14,6 +14,10 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.StatFs
 import android.view.TextureView
+import android.view.GestureDetector
+import android.view.ScaleGestureDetector
+import android.view.MotionEvent
+import android.widget.SeekBar
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.ArrayAdapter
@@ -28,6 +32,7 @@ import com.tod.astrophotography.camera.CameraController
 import com.tod.astrophotography.network.AstroServer
 import org.json.JSONObject
 import java.io.File
+import java.util.Locale
 
 class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     companion object { private const val CAMERA_PERMISSION_REQUEST = 1001 }
@@ -39,6 +44,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var cameraBadge: TextView
     private lateinit var histogram: HistogramView
     private lateinit var previewFramesLabel: TextView
+    private lateinit var zoomSlider: SeekBar
+    private lateinit var zoomLabel: TextView
+    private var zoomRatio = 1.0
     @Volatile private var cameraController: CameraController? = null
     @Volatile private var astroServer: AstroServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -51,7 +59,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val t = buildTelemetry()
             val camera = cameraController
             histogram.update(camera?.previewHistogram ?: IntArray(0))
-            previewFramesLabel.text = "Preview frames ${camera?.previewFrames?.get() ?: 0}"
+            val measured = camera?.measured()
+            previewFramesLabel.text = "Preview frames ${camera?.previewFrames?.get() ?: 0}" +
+                if ((measured?.optLong("exposure_us",0L) ?: 0L) > 0) " • ISO ${measured?.optInt("iso")} • ${measured?.optLong("exposure_us")} µs" else ""
             telemetry.text = "Battery ${t.optInt("battery_percent", 0)}%${if (t.optBoolean("charging")) " ⚡" else ""} • Temp ${"%.1f".format(t.optDouble("temperature_c", 0.0))}°C • Free ${"%.1f".format(t.optDouble("free_storage_gb", 0.0))} GB"
             astroServer?.sendEvent(JSONObject(t.toString()).put("event", "telemetry"))
             ui.postDelayed(this, 2000)
@@ -72,6 +82,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         histogram = findViewById(R.id.histogram)
         previewFramesLabel = findViewById(R.id.previewFrames)
         preview = findViewById(R.id.preview)
+        zoomSlider = findViewById(R.id.displayZoom)
+        zoomLabel = findViewById(R.id.zoomLabel)
+        setupDisplayZoom()
         status = findViewById(R.id.status)
         connection = findViewById(R.id.connection)
         telemetry = findViewById(R.id.telemetry)
@@ -138,6 +151,44 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
     }
 
+    private fun renderZoom(value: Double) {
+        zoomRatio = value
+        preview.scaleX = value.toFloat()
+        preview.scaleY = value.toFloat()
+        zoomSlider.progress = kotlin.math.round((value-1)*100).toInt()
+        zoomLabel.text = "Display %.1f×".format(Locale.US,value)
+    }
+
+    @android.annotation.SuppressLint("ClickableViewAccessibility")
+    private fun setupDisplayZoom() {
+        fun change(value: Double) { cameraController?.updateDisplayZoom(value) }
+        zoomSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (fromUser) change(1.0+progress/100.0)
+            }
+            override fun onStartTrackingTouch(bar: SeekBar) = Unit
+            override fun onStopTrackingTouch(bar: SeekBar) = Unit
+        })
+        val pinch = ScaleGestureDetector(this, object: ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                change(zoomRatio * detector.scaleFactor)
+                return true
+            }
+        })
+        val taps = GestureDetector(this, object: GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(event: MotionEvent): Boolean = true
+            override fun onDoubleTap(event: MotionEvent): Boolean {
+                change(1.0)
+                return true
+            }
+        })
+        findViewById<android.view.View>(R.id.previewFrame).setOnTouchListener { _, event ->
+            pinch.onTouchEvent(event)
+            if (!pinch.isInProgress && event.pointerCount == 1) taps.onTouchEvent(event)
+            true
+        }
+    }
+
     private fun startCamera() {
         if (cameraController != null) return
         cameraController = CameraController(
@@ -151,7 +202,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                     "capture_error" -> runOnUiThread { status.text = event.optString("message") }
                 }
             },
-            statusSink = { text -> runOnUiThread { status.text = text; cameraBadge.text = text } }
+            statusSink = { text -> runOnUiThread { status.text = text; cameraBadge.text = text } },
+            zoomSink = { ratio -> runOnUiThread { renderZoom(ratio) } }
         ).also { it.start() }
     }
 
@@ -175,9 +227,22 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         AlertDialog.Builder(this).setTitle("Capture preset")
             .setItems(presets.map { it.name }.toTypedArray()) { _, index ->
                 val preset = presets[index]
+                if (preset.name == "Solar") AlertDialog.Builder(this).setTitle("Solar imaging")
+                    .setMessage("A proper telescope solar filter fitted over the front aperture is required before pointing at the Sun.")
+                    .setPositiveButton("OK",null).show()
                 val settings = JSONObject().put("roi_percent", preset.crop)
+                if (preset.name == "Planetary") {
+                    settings.put("ois",false).put("eis",false)
+                    val modes = caps.optJSONObject("processing_modes")
+                    for (key in listOf("noise_reduction","edge","aberration")) {
+                        val values = modes?.optJSONArray(key)
+                        if ((0 until (values?.length() ?: 0)).any { values?.optInt(it,-1) == 0 }) settings.put(key,0)
+                    }
+                }
+                if (caps.optDouble("min_focus_distance") > 0 && preset.name != "General Manual") settings.put("manual_focus",true)
                 if (manual && preset.iso != null && preset.exposureUs != null) {
-                    settings.put("manual", true).put("iso", preset.iso).put("exposure_us", preset.exposureUs)
+                    settings.put("manual", true).put("iso", if (preset.name in listOf("Moon","Solar")) caps.optInt("iso_min",preset.iso) else preset.iso)
+                        .put("exposure_us", if (preset.name == "Deep Sky") caps.optLong("exposure_us_max",preset.exposureUs) else preset.exposureUs)
                 }
                 val suffix = when {
                     !manual -> " • Auto exposure"
@@ -224,8 +289,35 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         toggle("Manual exposure", "manual", manual)
         number("ISO (${caps.optInt("iso_min")}–${caps.optInt("iso_max")})", "iso", manual)
         number("Exposure (µs)", "exposure_us", manual)
-        toggle("Manual focus", "manual_focus", caps.optDouble("min_focus_distance") > 0)
-        number("Focus (diopters, 0 = infinity)", "focus_distance", caps.optDouble("min_focus_distance") > 0, true)
+        val maxFocus = caps.optDouble("min_focus_distance",0.0)
+        if (maxFocus > 0) {
+            val label = TextView(this)
+            val focus = SeekBar(this).apply {
+                max = 2000
+                progress = (controls.optDouble("focus_distance",0.0)/maxFocus*max).toInt()
+            }
+            fun showFocus() { label.text = "Focus %.3f D".format(Locale.US,focus.progress*maxFocus/focus.max) }
+            focus.setOnSeekBarChangeListener(object: SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                    showFocus()
+                    if (fromUser) camera.setControls(JSONObject().put("manual_focus",true).put("focus_distance",progress*maxFocus/bar.max))
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) = Unit
+                override fun onStopTrackingTouch(bar: SeekBar) = Unit
+            })
+            fun move(delta: Int?) {
+                focus.progress = delta?.let { focus.progress+it } ?: 0
+                camera.setControls(JSONObject().put("manual_focus",true).put("focus_distance",focus.progress*maxFocus/focus.max))
+            }
+            showFocus()
+            form.addView(label)
+            form.addView(focus)
+            form.addView(LinearLayout(this).apply {
+                for ((name, delta) in listOf("−" to -1, "Infinity" to null, "+" to 1)) {
+                    addView(Button(this@MainActivity).apply { text = name; setOnClickListener { move(delta) } })
+                }
+            })
+        }
         toggle("AE lock", "ae_lock", caps.optBoolean("ae_lock_supported"))
         toggle("AWB lock", "awb_lock", caps.optBoolean("awb_lock_supported"))
         number("Centered crop (%)", "roi_percent", caps.optDouble("max_zoom") > 1)
@@ -265,6 +357,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         val actions = linkedMapOf<String, () -> Unit>()
         actions["JPEG photo"] = { showCommandResult(camera.capture(JSONObject()), "Capturing JPEG…") }
+        if (caps.optInt("maximum_jpeg_width") > caps.optInt("jpeg_width")) {
+            val size = "${caps.optInt("maximum_jpeg_width")}×${caps.optInt("maximum_jpeg_height")}"
+            actions["Maximum sensor JPEG ($size)"] = {
+                showCommandResult(camera.capture(JSONObject().put("maximum_jpeg",true)), "Capturing maximum JPEG • preview pauses")
+            }
+        }
         if (caps.optBoolean("burst_capture") && !camera.isRecording()) {
             actions["JPEG burst"] = {
                 val counts = intArrayOf(3, 5, 10, 16)
@@ -296,7 +394,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                     val (_, width, height, fps) = match.groupValues
                     val request = JSONObject().put("width", width.toInt()).put("height", height.toInt())
                         .put("fps", fps.toInt()).put("high_speed", highSpeed)
-                    showCommandResult(camera.startVideo(request), "Starting video…")
+                    if (highSpeed && camera.controlState().optBoolean("manual_focus")) {
+                        AlertDialog.Builder(this).setTitle("Constrained high-speed video")
+                            .setMessage("Camera2 may override manual focus, exposure, and crop in this mode. Use standard video to preserve manual settings.")
+                            .setNegativeButton("Cancel",null)
+                            .setPositiveButton("Start") { _,_ -> showCommandResult(camera.startVideo(request),"Starting video…") }.show()
+                    } else showCommandResult(camera.startVideo(request), "Starting video…")
                 }.setNegativeButton("Cancel", null).show()
         }
         if (camera.isRecording()) actions["Stop video"] = { showCommandResult(camera.stopVideo(), "Finalizing video…") }
@@ -323,6 +426,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         return JSONObject()
             .put("ok", true)
             .put("recording", cameraController?.isRecording() == true)
+            .put("display_zoom",cameraController?.previewZoom() ?: 1.0)
+            .put("effective",cameraController?.measured() ?: JSONObject())
             .put("usb_power", (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0)
             .put("preview_frames", cameraController?.previewFrames?.get() ?: 0)
             .put("battery_percent", battery)

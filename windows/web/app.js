@@ -13,7 +13,7 @@ function setConnected(device) {
 }
 
 function n(v,d=1){return Number(v||0).toFixed(d)}
-function render(s){state=s;const d=s.device,m=s.metrics,seq=s.sequence,ss=s.session;setConnected(d);$('sideHost').textContent=d.usb?.detail || 'Looking for a USB phone';$('footerStatus').textContent=d.connected?'Camera online':d.status;$('footerDetail').textContent=d.usb?.state==='unauthorized' ? d.usb.detail : d.last_error|| (d.connected?`Camera ${d.camera||'ready'}`:'Auto-discovery runs in the background.');$('fpsBadge').textContent=n(m.fps,1)+' FPS';$('bitrateBadge').textContent=n(m.bitrate_mbps,2)+' Mb/s';$('focusMetric').textContent=n(m.focus_score,1);$('focusBig').textContent=n(m.focus_score,1);$('focusTrend').textContent=m.focus_score>lastFocus?'▲ improving':m.focus_score<lastFocus?'▼ softer':'stable';lastFocus=m.focus_score;$('meanMetric').textContent=n(m.mean,0);$('shadowMetric').textContent=n(m.shadow_clip,2)+'%';$('highlightMetric').textContent=n(m.highlight_clip,2)+'%';$('resBadge').textContent=capText('preview_width','preview_height');drawHist(currentMode()==='Live Stack' && $('showStack').checked && s.stack?.accepted ? s.stack.histogram : m.histogram||[]);renderFocus(m);$('seqStatus').textContent=seq.message||'Idle';$('integration').textContent=seq.integration_us ? `Light integration ${n(seq.integration_us / 1e6, 2)} s` : '';$('seqCount').textContent=`${seq.completed||0} / ${seq.requested||0}`;$('seqBar').style.width=(seq.requested?Math.min(100,(seq.completed/seq.requested)*100):0)+'%';$('sirilStatus').textContent=ss.siril_status || (ss.siril_path?'Detected':'Not detected');$('fileCount').textContent=(ss.captured_files||[]).length;$('pcFolder').textContent='Session: '+(ss.current_dir||'ready').split('\\').slice(-3).join(' / ');renderTelemetry(d.telemetry||{});renderCaps(d.capabilities||{});renderStack(s.stack);renderWorkflow(s);}
+function render(s){state=s;const d=s.device,m=s.metrics,seq=s.sequence,ss=s.session;setConnected(d);$('sideHost').textContent=d.usb?.detail || 'Looking for a USB phone';$('footerStatus').textContent=d.connected?'Camera online':d.status;$('footerDetail').textContent=d.usb?.state==='unauthorized' ? d.usb.detail : d.last_error|| (d.connected?`Camera ${d.camera||'ready'}`:'Auto-discovery runs in the background.');$('fpsBadge').textContent=n(m.fps,1)+' FPS';$('bitrateBadge').textContent=n(m.bitrate_mbps,2)+' Mb/s';$('focusMetric').textContent=n(m.focus_score,1);$('focusBig').textContent=n(m.focus_score,1);$('focusTrend').textContent=m.focus_score>lastFocus?'▲ improving':m.focus_score<lastFocus?'▼ softer':'stable';lastFocus=m.focus_score;$('meanMetric').textContent=n(m.mean,0);$('shadowMetric').textContent=n(m.shadow_clip,2)+'%';$('highlightMetric').textContent=n(m.highlight_clip,2)+'%';$('resBadge').textContent=capText('preview_width','preview_height');drawHist(currentMode()==='Live Stack' && $('showStack').checked && s.stack?.accepted ? s.stack.histogram : m.histogram||[]);renderFocus(m);$('seqStatus').textContent=seq.message||'Idle';$('integration').textContent=seq.integration_us ? `Light integration ${n(seq.integration_us / 1e6, 2)} s` : '';$('seqCount').textContent=`${seq.completed||0} / ${seq.requested||0}`;$('seqBar').style.width=(seq.requested?Math.min(100,(seq.completed/seq.requested)*100):0)+'%';$('sirilStatus').textContent=ss.siril_status || (ss.siril_path?'Detected':'Not detected');$('fileCount').textContent=(ss.captured_files||[]).length;$('pcFolder').textContent='Session: '+(ss.current_dir||'ready').split('\\').slice(-3).join(' / ');renderTelemetry(d.telemetry||{});renderCaps(d.capabilities||{});renderStack(s.stack);renderWorkflow(s);renderImaging(s);}
 function capText(a,b){const c=state?.device?.capabilities||{};return c[a]&&c[b]?`${c[a]}×${c[b]}`:'—'}
 function yes(x){return x===true?'YES':x===false?'NO':'—'}
 function renderCaps(c) {
@@ -25,7 +25,7 @@ function renderCaps(c) {
   const supported = {
     manualToggle: c.manual_sensor, iso: c.manual_sensor, exposure: c.manual_sensor,
     manualFocus: c.min_focus_distance > 0, focus: c.min_focus_distance > 0, aeLock: c.ae_lock_supported, awbLock: c.awb_lock_supported,
-    ois: c.ois_modes?.includes(1), eis: c.eis_modes?.includes(1), roi: c.max_zoom > 1
+    ois: c.ois_modes?.includes(1), eis: c.eis_modes?.includes(1), roi: c.max_zoom > 1 && !$('fpsMode').value.endsWith(' • HS')
   };
   for (const [id, available] of Object.entries(supported)) {
     $(id).disabled = !available;
@@ -97,17 +97,40 @@ function refreshPreview() {
   }
   setTimeout(refreshPreview, 100);
 }
-function postControls(){const rv=$('roi').value;const rp=rv==='75%'?75:rv==='50%'?50:rv==='25%'?25:100;return api('/api/controls',{manual:$('manualToggle').checked,iso:+$('iso').value,exposure_us:+$('exposure').value,focus_distance:+$('focus').value,manual_focus:$('manualFocus').checked,ae_lock:$('aeLock').checked,awb_lock:$('awbLock').checked,ois:$('ois').value,eis:$('eis').value,roi_percent:rp,awb_mode:+$('awbMode').value||1})}
+function postControls(){const processing = Object.fromEntries([...document.querySelectorAll('#processingControls select')].filter(x=>x.value!=='').map(x=>[x.name,+x.value]));const rv=$('roi').value;const rp=rv==='75%'?75:rv==='50%'?50:rv==='25%'?25:100;return api('/api/controls',{...processing,manual:$('manualToggle').checked,iso:+$('iso').value,exposure_us:+$('exposure').value,focus_distance:+$('focus').value,manual_focus:$('manualFocus').checked,ae_lock:$('aeLock').checked,awb_lock:$('awbLock').checked,ois:$('ois').value,eis:$('eis').value,roi_percent:rp,fixed_color:$('fixedColor').checked,awb_mode:+$('awbMode').value||1})}
 function currentMode(){return document.querySelector('.nav.active')?.dataset.mode||'Capture'}
 function saveSession(){return api('/api/session',{target:$('targetInput').value,mode:currentMode()})}
 function parseVideoMode(){const t=$('fpsMode').value||'';const m=t.match(/(\d+)[×x](\d+).*?(\d+)(?:-\d+)?\s*fps/i);return m?{width:+m[1],height:+m[2],fps:+m[3],high_speed:t.endsWith(' • HS')}:null}
-$('startVideoBtn').onclick=async()=>{try{await saveSession();await postControls();const v=parseVideoMode();if(!v)throw new Error("No video mode selected");await api('/api/video/start',{...v,duration:+$('duration').value,frame_limit:+$('videoFrameLimit').value,target:$('targetInput').value,mode:currentMode(),rank_frames:$('rankFrames').checked})}catch(e){alert(e.message)}};$('stopVideoBtn').onclick=()=>api('/api/video/stop',{}).catch(e=>alert(e.message));
-$('applyBtn').onclick=()=>postControls().catch(alert);$('singleBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/capture',{raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw',target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value})}catch(e){alert(e.message)}};$('startSeqBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/sequence/start',{target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value,count:+$('count').value,interval_ms:+$('interval').value,calibration:calibrationSelection(),raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw'})}catch(e){alert(e.message)}};$('stopSeqBtn').onclick=()=>api('/api/sequence/stop',{});$('reconnectBtn').onclick=()=>api('/api/reconnect',{});$('manualConnectBtn').onclick=()=>api('/api/manual-connect',{host:$('manualIp').value}).catch(e=>alert(e.message));$('sirilBtn').onclick=()=>api('/api/siril',{calibration:calibrationSelection()}).catch(e=>alert(e.message));
-[...document.querySelectorAll('.nav')].forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('pageTitle').textContent=b.dataset.mode;$('pageHint').textContent=hints[b.dataset.mode]||'';if(b.dataset.mode==='Planetary'){$('profile').value='Jupiter';$('count').value=1000;$('interval').value=0}else if(b.dataset.mode==='Lunar / Solar'){$('profile').value='Moon';$('count').value=100;$('interval').value=50}else if(b.dataset.mode==='Deep Sky'){$('profile').value='Deep Sky';$('count').value=30;$('interval').value=1000}selectWorkflow(b.dataset.mode);});
+$('startVideoBtn').onclick=async()=>{try{await saveSession();await postControls();const v=parseVideoMode();if(!v)throw new Error("No video mode selected");if(v.high_speed && $('manualFocus').checked && !confirm("Camera2 high-speed mode may override manual focus. Use standard video to preserve it. Start high-speed video?"))return;await api('/api/video/start',{...v,duration:+$('duration').value,frame_limit:+$('videoFrameLimit').value,target:$('targetInput').value,mode:currentMode(),rank_frames:$('rankFrames').checked})}catch(e){alert(e.message)}};$('stopVideoBtn').onclick=()=>api('/api/video/stop',{}).catch(e=>alert(e.message));
+$('applyBtn').onclick=()=>postControls().catch(alert);$('singleBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/capture',{maximum_jpeg:$('maximumJpeg').checked,raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw',target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value})}catch(e){alert(e.message)}};$('startSeqBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/sequence/start',{target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value,count:+$('count').value,interval_ms:+$('interval').value,calibration:calibrationSelection(),raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw'})}catch(e){alert(e.message)}};$('stopSeqBtn').onclick=()=>api('/api/sequence/stop',{});$('reconnectBtn').onclick=()=>api('/api/reconnect',{});$('manualConnectBtn').onclick=()=>api('/api/manual-connect',{host:$('manualIp').value}).catch(e=>alert(e.message));$('sirilBtn').onclick=()=>api('/api/siril',{calibration:calibrationSelection()}).catch(e=>alert(e.message));
+[...document.querySelectorAll('.nav')].forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('pageTitle').textContent=b.dataset.mode;$('pageHint').textContent=hints[b.dataset.mode]||'';if(b.dataset.mode==='Planetary'){$('profile').value='Jupiter';$('count').value=1000;$('interval').value=0}else if(b.dataset.mode==='Lunar / Solar'){$('profile').value='Moon';$('count').value=100;$('interval').value=50}else if(b.dataset.mode==='Deep Sky'){$('profile').value='Deep Sky';$('count').value=30;$('interval').value=1000}selectWorkflow(b.dataset.mode);if(['Planetary','Lunar / Solar','Deep Sky'].includes(b.dataset.mode))applyProfile();});
 [...document.querySelectorAll('.tab')].forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab-body').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab+'Tab').classList.add('active')});
 $('targetInput').onchange=saveSession;
 function clamp(v,min,max){v=+v;if(Number.isFinite(+min))v=Math.max(v,+min);if(Number.isFinite(+max))v=Math.min(v,+max);return Math.round(v)}
-function applyProfile(){const p=$('profile').value,c=state?.device?.capabilities||{};const preset={Jupiter:{iso:200,exp:5000,roi:'50%',duration:60,count:1000},Saturn:{iso:400,exp:10000,roi:'50%',duration:90,count:1500},Venus:{iso:100,exp:2000,roi:'50%',duration:60,count:1000},Mars:{iso:200,exp:3000,roi:'25%',duration:60,count:1200},Moon:{iso:100,exp:2000,roi:'Full frame',duration:30,count:200},Sun:{iso:50,exp:1000,roi:'Full frame',duration:20,count:200},'Deep Sky':{iso:800,exp:1000000,roi:'Full frame',duration:60,count:30}}[p];$('targetInput').value=p==='Deep Sky'?'M42 Orion Nebula':p;if(preset){$('iso').value=clamp(preset.iso,c.iso_min,c.iso_max);$('exposure').value=clamp(preset.exp,c.exposure_us_min,c.exposure_us_max);$('roi').value=preset.roi;$('duration').value=preset.duration;$('count').value=preset.count;$('interval').value=p==='Deep Sky'?1000:0}saveSession()}
+function applyProfile(){const p=$('profile').value,c=state?.device?.capabilities||{};const preset={Jupiter:{iso:200,exp:5000,roi:'50%',duration:60,count:1000},Saturn:{iso:400,exp:10000,roi:'50%',duration:90,count:1500},Venus:{iso:100,exp:2000,roi:'50%',duration:60,count:1000},Mars:{iso:200,exp:3000,roi:'25%',duration:60,count:1200},Moon:{iso:100,exp:2000,roi:'Full frame',duration:30,count:200},Sun:{iso:50,exp:1000,roi:'Full frame',duration:20,count:200},'Deep Sky':{iso:800,exp:1000000,roi:'Full frame',duration:60,count:30}}[p];$('targetInput').value=p==='Deep Sky'?'M42 Orion Nebula':p;if(preset){
+  $('iso').value=clamp(['Sun','Moon'].includes(p) ? c.iso_min || preset.iso : preset.iso,c.iso_min,c.iso_max);
+  $('exposure').value=clamp(p==='Deep Sky' ? c.exposure_us_max || preset.exp : preset.exp,c.exposure_us_min,c.exposure_us_max);
+  if(c.manual_sensor) $('manualToggle').checked=true;
+  if(c.min_focus_distance>0) $('manualFocus').checked=true;
+  if(['Jupiter','Saturn','Mars','Venus'].includes(p)) {
+    const supported=[...$('fpsMode').options].map(option=>({
+      value:option.value, match:option.value.match(/^(\d+)×(\d+) @ (\d+) fps$/)
+    })).filter(item=>item.match);
+    supported.sort((a,b)=>Number(b.match[3])-Number(a.match[3]) ||
+      Number(a.match[1])*Number(a.match[2])-Number(b.match[1])*Number(b.match[2]));
+    if(supported.length)$('fpsMode').value=supported[0].value;
+    $('ois').value='off'; $('eis').value='off';
+    for (const key of ['noise_reduction','edge','aberration']) {
+      const control=$('processing-'+key);
+      if(control && [...control.options].some(x=>x.value==='0')) control.value='0';
+    }
+  }
+  if(p==='Deep Sky' && c.raw_session_available) $('format').value='raw';
+  if(['Sun','Moon'].includes(p)) $('format').value='jpeg';
+  $('roi').value=preset.roi;$('duration').value=preset.duration;$('count').value=preset.count;$('interval').value=p==='Deep Sky'?1000:0;
+}
+$('solarWarning').hidden=p!=='Sun';
+saveSession()}
 $('profile').onchange=applyProfile;
 [...document.querySelectorAll('[data-overlay]')].forEach(b=>b.onclick=()=>{b.classList.toggle('active');if(b.dataset.overlay==='crosshair')$('crosshair').classList.toggle('show',b.classList.contains('active'));if(b.dataset.overlay==='clip')$('clipOverlay').classList.toggle('show',b.classList.contains('active'))});$('crosshair').classList.add('show');$('clipToggle').onchange=e=>$('clipOverlay').classList.toggle('show',e.target.checked);$('redBtn').onclick=()=>{document.body.classList.toggle('red-mode');$('redBtn').classList.toggle('active')};$('fitBtn').onclick=()=>{$('preview').style.maxWidth='100%';$('preview').style.maxHeight='100%'};$('oneBtn').onclick=()=>{$('preview').style.maxWidth='none';$('preview').style.maxHeight='none'};
 
@@ -197,7 +220,7 @@ function selectWorkflow(mode) {
 
 function renderFocus(metrics) {
   $('stellarFocus').textContent = metrics.star ? `HFR ${n(metrics.star.hfr,2)} px · FWHM ${n(metrics.star.fwhm,2)} px` : '—';
-  $('stellarReason').textContent = metrics.star ? 'Background-subtracted profile · Gaussian-equivalent FWHM' : 'Center an isolated, unsaturated star.';
+  $('stellarReason').textContent = metrics.star ? 'Background-subtracted profile · Gaussian-equivalent FWHM' : 'Pick an isolated, unsaturated star in the preview.';
   const canvas = $('focusHistory'), ctx = canvas.getContext('2d');
   const history = metrics.focus_history || [];
   ctx.clearRect(0,0,canvas.width,canvas.height);
@@ -242,6 +265,139 @@ $('burstBtn').onclick = async () => {
     $('burstReason').textContent = 'Burst requested. Captured files appear in the current session.';
   } catch(e) { alert(e.message); }
 };
-$('focusZoom').onchange = () => $('viewer').classList.toggle('focus-zoom', $('focusZoom').checked);
+$('focusZoom').onchange = () => requestZoom($('focusZoom').checked ? 2.5 : 1);
 $('showStack').onchange = () => { lastStackCount = 0; };
+let zoomTimer, zoomInFlight = false, zoomQueued = null, zoomValue = 1;
+function paintZoom(value) {
+  zoomValue = value;
+  $('displayZoom').value = value;
+  $('displayZoomValue').textContent = value.toFixed(1)+'×';
+  $('preview').style.setProperty('--preview-zoom', value);
+  $('focusZoom').checked = value > 1;
+  updateAnalysisOverlay();
+}
+async function sendZoom() {
+  if (zoomInFlight || zoomQueued === null) return;
+  const value = zoomQueued;
+  zoomQueued = null;
+  zoomInFlight = true;
+  try {
+    const reply = await api('/api/display-zoom',{ratio:value});
+    if (zoomQueued === null && Number.isFinite(reply.display_zoom)) paintZoom(reply.display_zoom);
+  } catch (err) {
+    $('footerDetail').textContent = err.message;
+  } finally {
+    zoomInFlight = false;
+    if (zoomQueued !== null) sendZoom();
+  }
+}
+let focusPointArmed = false;
+$('pickFocusPoint').onclick = () => {
+  focusPointArmed = !focusPointArmed;
+  $('pickFocusPoint').setAttribute('aria-pressed',String(focusPointArmed));
+  $('viewer').style.cursor=focusPointArmed ? 'crosshair' : '';
+};
+$('resetFocusPoint').onclick = () => api('/api/focus-roi',null).catch(e=>alert(e.message));
+$('viewer').addEventListener('click',event=>{
+  if(!focusPointArmed || !state?.device.connected)return;
+  const box=$('preview').getBoundingClientRect();
+  if(!box.width || !box.height)return;
+  const x=(event.clientX-box.left)/box.width,y=(event.clientY-box.top)/box.height;
+  if(x<0||x>1||y<0||y>1)return;
+  $('pickFocusPoint').click();
+  api('/api/focus-roi',{x,y}).catch(e=>alert(e.message));
+});
+function requestZoom(value) {
+  if ($('displayZoom').disabled) return;
+  paintZoom(value);
+  zoomQueued = value;
+  if (!zoomTimer) zoomTimer = setTimeout(() => { zoomTimer = null; sendZoom(); },55);
+}
+$('displayZoom').oninput = () => requestZoom(+$('displayZoom').value);
+$('resetZoom').onclick = () => requestZoom(1);
+$('viewer').ondblclick = () => requestZoom(1);
+
+const processingLabels = {
+  noise_reduction:['Noise reduction',['Off','Fast','High quality','Minimal','Zero shutter lag']],
+  edge:['Edge enhancement',['Off','Fast','High quality','Zero shutter lag']],
+  hot_pixel:['Hot pixel correction',['Off','Fast','High quality']],
+  tonemap:['Tone mapping',[null,'Fast','High quality']],
+  aberration:['Chromatic aberration correction',['Off','Fast','High quality']]
+};
+let processingSignature = '';
+function renderImaging(s) {
+  const c=s.device.capabilities, t=s.device.telemetry, measured=t.effective || {};
+  const zoom = t.display_zoom ?? c.capture_settings?.display_zoom ?? 1;
+  $('displayZoom').disabled = !s.device.connected || !c.display_zoom_max;
+  $('resetZoom').disabled = $('displayZoom').disabled;
+  $('pickFocusPoint').disabled=!s.device.connected;
+  $('resetFocusPoint').disabled=!s.focus_point;
+  const point=s.focus_point;
+  $('preview').style.transformOrigin=point ? `${point.x*100}% ${point.y*100}%` : 'center';
+  $('focusZoom').disabled = $('displayZoom').disabled;
+  if (zoomQueued === null && !zoomInFlight && zoom !== zoomValue) paintZoom(zoom);
+  const format=$('format').value;
+  const maximum = c.maximum_jpeg_width > c.jpeg_width && format==='jpeg';
+  $('maximumJpegRow').hidden=!maximum;
+  if(!maximum)$('maximumJpeg').checked=false;
+  if($('maximumJpeg').checked) {
+    $('startSeqBtn').disabled=true;
+    $('startSeqBtn').title='Maximum sensor JPEG is a single still';
+    $('burstBtn').disabled=true;
+    $('burstBtn').title='Maximum sensor JPEG is a single still';
+  } else $('burstBtn').title='';
+  $('maximumJpegSize').textContent=maximum ? capText('maximum_jpeg_width','maximum_jpeg_height')+' · single still; preview pauses' : '';
+  const jpeg=$('maximumJpeg').checked ? capText('maximum_jpeg_width','maximum_jpeg_height') : capText('jpeg_width','jpeg_height');
+  const raw=capText('raw_width','raw_height');
+  $('resBadge').textContent='Preview '+capText('preview_width','preview_height');
+  $('captureBadge').textContent=s.video.recording && s.video.width ? `Video ${s.video.width}×${s.video.height} · ${s.video.fps} FPS` : format==='raw' ? 'DNG '+raw : format==='raw+jpeg' ? `JPEG ${jpeg} + DNG ${raw}` : 'JPEG '+jpeg;
+  $('exposureRange').textContent=c.exposure_us_max ? `${c.exposure_us_min}–${c.exposure_us_max} µs` : 'µs';
+  $('effectiveExposure').textContent=measured.iso != null && measured.exposure_us != null ?
+      `Measured ISO ${measured.iso} · ${n(measured.exposure_us,2)} µs${measured.active_physical_id==null?'':` · active camera ${measured.active_physical_id}`}` : '';
+  $('effectiveStabilization').textContent=[measured.ois==null?'':('OIS '+(measured.ois?'on':'off')),measured.eis==null?'':('EIS '+(measured.eis?'on':'off'))].filter(Boolean).join(' · ');
+  const focusAvailable = Boolean(c.min_focus_distance > 0) && !$('applyBtn').disabled;
+  $('focusSlider').disabled=!focusAvailable;
+  $('focusSlider').max=c.min_focus_distance || 0;
+  if (document.activeElement !== $('focusSlider')) $('focusSlider').value=$('focus').value;
+  for (const child of $('focusSteps').children) child.disabled=!focusAvailable;
+  $('fixedColorRow').hidden=!c.fixed_color_supported;
+  $('fixedColor').disabled=!c.fixed_color_supported || !measured.fixed_color_ready;
+  $('fixedColor').title=$('fixedColor').disabled ? 'Wait for a Camera2 auto white-balance result' : '';
+  $('telescopeStabilization').hidden=$('ois').disabled && $('eis').disabled;
+  const modes=c.processing_modes || {};
+  const signature=JSON.stringify(modes);
+  if(signature!==processingSignature) {
+    $('processingControls').replaceChildren();
+    for(const [key,[label,names]] of Object.entries(processingLabels)) {
+      const options=(modes[key] || []).filter(value=>names[value]);
+      if(!options.length)continue;
+      const row=document.createElement('label');
+      row.className='field';
+      const title=document.createElement('span');title.textContent=label;
+      const control=document.createElement('select');control.id='processing-'+key;control.name=key;
+      control.append(new Option('Keep current',''),...options.map(value=>new Option(names[value],value)));
+      control.value=c.capture_settings?.[key] ?? '';
+      row.append(title,control);$('processingControls').append(row);
+    }
+    processingSignature=signature;
+  }
+}
+let focusTimer;
+function moveFocus(distance) {
+  const max=state?.device?.capabilities?.min_focus_distance || 0;
+  const value=Math.min(max,Math.max(0,distance));
+  $('focus').value=value.toFixed(3);
+  $('focusSlider').value=value;
+  $('manualFocus').checked=true;
+  clearTimeout(focusTimer);
+  focusTimer=setTimeout(()=>api('/api/controls',{manual_focus:true,focus_distance:value}).catch(e=>alert(e.message)),70);
+}
+$('focusSlider').oninput=()=>moveFocus(+$('focusSlider').value);
+$('focusMinus').onclick=()=>moveFocus(+$('focus').value-.01);
+$('focusPlus').onclick=()=>moveFocus(+$('focus').value+.01);
+$('focusInfinity').onclick=()=>moveFocus(0);
+$('telescopeStabilization').onclick=()=>{
+  $('ois').value='off';$('eis').value='off';
+  api('/api/controls',{ois:false,eis:false}).catch(e=>alert(e.message));
+};
 poll();refreshPreview();
