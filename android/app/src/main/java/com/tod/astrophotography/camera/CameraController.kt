@@ -65,6 +65,7 @@ class CameraController(
     @Volatile private var started = false
     @Volatile private var mediaRecorder: MediaRecorder? = null
     private var recordingFile: File? = null
+    private var recordingTimer: Runnable? = null
     @Volatile private var recording = false
 
     private var iso = 200
@@ -113,6 +114,8 @@ class CameraController(
     fun stop() {
         started = false
         cameraHandler.post {
+            recordingTimer?.let(cameraHandler::removeCallbacks)
+            recordingTimer = null
             if (recording || mediaRecorder != null) {
                 try { mediaRecorder?.stop() } catch (_: Exception) {}
                 try { mediaRecorder?.release() } catch (_: Exception) {}
@@ -309,10 +312,11 @@ class CameraController(
         val height = payload.optInt("height", 1080).coerceAtLeast(240)
         val fps = payload.optInt("fps", 30).coerceIn(1, 1000)
         val highSpeed = payload.optBoolean("high_speed", false)
+        val durationMs = payload.optLong("duration", 0).coerceIn(0, 86_400) * 1000
         val bitrate = payload.optInt("bitrate", if (width >= 3840) 80_000_000 else if (width >= 1920) 30_000_000 else 12_000_000)
         cameraHandler.post {
             try {
-                configureRecording(width, height, fps, bitrate, highSpeed)
+                configureRecording(width, height, fps, bitrate, highSpeed, durationMs)
             } catch (e: Exception) {
                 mediaRecorder?.release()
                 mediaRecorder = null
@@ -332,7 +336,7 @@ class CameraController(
         return JSONObject().put("ok", true).put("status", "video_stopping")
     }
 
-    private fun configureRecording(requestedWidth: Int, requestedHeight: Int, requestedFps: Int, bitrate: Int, highSpeed: Boolean) {
+    private fun configureRecording(requestedWidth: Int, requestedHeight: Int, requestedFps: Int, bitrate: Int, highSpeed: Boolean, durationMs: Long) {
         val camera = cameraDevice ?: return
         val chars = characteristics ?: return
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
@@ -403,6 +407,11 @@ class CameraController(
                     }
                     recorder.start()
                     recording = true
+                    if (durationMs > 0) {
+                        val timer = Runnable { if (mediaRecorder === recorder) stopRecordingInternal() }
+                        recordingTimer = timer
+                        cameraHandler.postDelayed(timer, durationMs)
+                    }
                     statusSink("Recording ${size.width}×${size.height} @ ${fps} fps")
                     eventSink(JSONObject().put("event", "video_started").put("path", out.absolutePath).put("width", size.width).put("height", size.height).put("fps", fps))
                 } catch (e: Exception) {
@@ -429,6 +438,8 @@ class CameraController(
     }
 
     private fun stopRecordingInternal() {
+        recordingTimer?.let(cameraHandler::removeCallbacks)
+        recordingTimer = null
         val recorder = mediaRecorder
         val file = recordingFile
         try { session?.stopRepeating() } catch (_: Exception) {}
@@ -448,7 +459,7 @@ class CameraController(
             try { file.delete() } catch (_: Exception) {}
             eventSink(JSONObject().put("event", "capture_error").put("message", "Video recording did not finalize correctly"))
         }
-        configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
+        if (started) configureReadersAndSession(includeRaw = hardwareRawSupported && rawSize != null)
     }
 
     private fun chooseCamera() {
@@ -512,6 +523,27 @@ class CameraController(
                 statusSink("Camera error code $error")
             }
         }, cameraHandler)
+    }
+
+    private fun recoverCamera(message: String) {
+        statusSink("$message • retrying")
+        if (synchronized(captureLock) { pendingCapture != null }) failPending(message)
+        if (recording || mediaRecorder != null) stopRecordingInternal()
+        session?.close()
+        session = null
+        repeatingBuilder = null
+        rawSessionAvailable = false
+        val retry = object : Runnable {
+            override fun run() {
+                if (!started || cameraDevice != null) return
+                try { openCamera() }
+                catch (e: Exception) {
+                    statusSink("Camera unavailable: ${e.message} • retrying")
+                    cameraHandler.postDelayed(this, 3000)
+                }
+            }
+        }
+        cameraHandler.postDelayed(retry, 3000)
     }
 
     private fun configureReadersAndSession(includeRaw: Boolean) {

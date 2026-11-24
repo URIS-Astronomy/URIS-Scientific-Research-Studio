@@ -1075,20 +1075,11 @@ func (a *App) routes() http.Handler {
 			return
 		}
 		a.mu.Lock()
-		a.video.Message = "Starting"
-		a.mu.Unlock()
-		if seconds, ok := asInt(p["duration"]); ok && seconds > 0 {
-			go func(d time.Duration) {
-				t := time.NewTimer(d)
-				defer t.Stop()
-				select {
-				case <-a.stop:
-					return
-				case <-t.C:
-					_, _ = a.command("stop_video", map[string]any{}, 8*time.Second)
-				}
-			}(time.Duration(seconds) * time.Second)
+		if !a.video.Recording && a.video.Message != "Error" {
+			a.video.Message = "Starting"
 		}
+		a.mu.Unlock()
+
 		writeJSON(w, resp)
 	})
 	mux.HandleFunc("/api/video/stop", func(w http.ResponseWriter, r *http.Request) {
