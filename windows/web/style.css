@@ -37,3 +37,28 @@ button:disabled { cursor: default; opacity: .55; }
 [hidden] { display: none !important; }
 #confirmDashboard { color: #ecf3ff; background: #16253d; border: 1px solid #557197; border-radius: .5rem; }
 .statusbar a { color: #9cbef4; }
+
+.quality-toolbar select {
+  color-scheme: dark;
+  color: var(--text);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  min-height: 27px;
+  padding: 2px 5px;
+}
+
+.quality-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.quality-toolbar input[type=checkbox] {
+  flex: none;
+  min-width: 0;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--blue);
+}
