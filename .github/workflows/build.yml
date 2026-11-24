@@ -58,6 +58,8 @@ jobs:
           go vet ./...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check web/app.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check web/overlay.js
       - name: Build Windows GUI
         run: go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../TOD_Astro_Suite.exe .
       - uses: actions/upload-artifact@v4

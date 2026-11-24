@@ -1,9 +1,7 @@
 # Engineering RC validation
 
-GitHub Actions runs an Android Gradle build and lint job and a native Windows compile, Go test, Go vet, and JavaScript syntax job. Each successful job uploads its installable artifact.
+The Android workflow compiles and lints the APK. Its Gradle unit-test task currently has no test sources. The Windows workflow builds the executable and runs Go tests, Go vet, and syntax checks for the dashboard and analysis worker.
 
-Go regression coverage exercises the embedded dashboard entry points and verifies that a still sequence counts only matching successful captures. The Android Gradle unit-test task has no test sources. Camera2 stream combinations, installation and capture on a physical Vivo T3 Ultra, native Windows UI interaction, and Siril processing require runtime verification.
+Go tests cover capture correlation, reconnect between exposures, interrupted journal recovery, synthetic stellar HFR/FWHM, dark/flat correction, and uncompressed Bayer DNG decoding. The local dashboard smoke test uses a mock phone and exercises discovery, preview, video mode selection, still sequence delivery, and live-stack PNG export.
 
-Local validation also exercised the dashboard in Chromium using a mock phone. It covered automatic discovery, the live preview, stable video-mode selection, receipt of a three-frame sequence, and live-stack PNG export.
-
-A separate mock-phone test disconnected the control and preview sockets after the first exposure in a four-frame sequence. After discovery reconnected, live view returned and the remaining exposures completed.
+Hardware qualification still requires the Vivo T3 Ultra and a Windows PC for the live capture, high-speed recording, focus, DNG and thermal soak. The Android APK is debug-signed and the Windows executable is unsigned. The optional Siril CLI integration needs an end-to-end test with a supported installation.

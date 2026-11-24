@@ -62,6 +62,7 @@
           <label class="field"><span>Manual sensor</span><input id="manualToggle" type="checkbox" checked /></label>
           <label class="field"><span>ISO <small id="isoRange">capability aware</small></span><input id="iso" type="number" value="200" /></label>
           <label class="field"><span>Exposure <small>µs</small></span><input id="exposure" type="number" value="10000" /></label>
+          <label class="field"><span>Manual focus</span><input id="manualFocus" type="checkbox"/></label>
           <label class="field"><span>Focus distance <small>diopters</small></span><input id="focus" type="number" step="0.01" value="0" /></label>
           <button class="primary full" id="applyBtn">Apply camera controls</button>
           <div class="section-title">Camera capabilities</div>
@@ -85,19 +86,31 @@
           <label class="field"><span>Frame count</span><input id="count" type="number" min="1" value="100" /></label>
           <label class="field"><span>Interval <small>ms</small></span><input id="interval" type="number" min="0" value="0" /></label>
           <div class="run-buttons"><button class="capture" id="singleBtn">Single capture</button><button class="primary" id="startSeqBtn">Start sequence</button></div>
+          <div class="run-buttons">
+            <label class="field"><span>Burst frames</span><input id="burstCount" type="number" min="2" max="16" value="5"/></label>
+            <button class="primary" id="burstBtn" disabled>JPEG burst</button>
+          </div>
+          <output id="burstReason" class="hint"></output>
           <button class="danger full" id="stopSeqBtn">Stop sequence</button>
           <div class="progress-card"><div class="progress-head"><b id="seqStatus">Idle</b><span id="seqCount">0 / 0</span></div><div class="progress"><i id="seqBar"></i></div></div>
           <div id="integration" role="status"></div>
           <div id="stackTools" hidden>
             <label class="field"><span>Show stack</span><input id="showStack" type="checkbox" checked /></label>
             <output id="stackStats"></output>
+            <label class="field"><span>Dark master source</span><select id="calDark"><option value="">None</option></select></label>
+            <label class="field"><span>Flat master source</span><select id="calFlat"><option value="">None</option></select></label>
+            <label class="field"><span>Bias master source</span><select id="calBias"><option value="">None</option></select></label>
+            <div class="hint">Select calibration sequences with the same input format as the lights. RAW stacking requires an uncompressed 16-bit Bayer DNG. Use matching ISO, crop and resolution, and match dark exposure and temperature.</div>
             <a id="saveStack" href="/api/stack.png?download" hidden>Save stack PNG</a>
           </div>
           <div class="section-title">Planetary video</div>
           <label class="field"><span>Resolution / FPS</span><select id="fpsMode" disabled><option>Connect phone to query modes</option></select></label>
           <label class="field"><span>ROI</span><select id="roi"><option>Full frame</option><option>75%</option><option>50%</option><option>25%</option></select></label>
           <label class="field"><span>Capture duration <small>s</small></span><input id="duration" type="number" value="60" /></label>
+          <label class="field"><span>Video frame limit <small>0 = duration only</small></span><input id="videoFrameLimit" type="number" min="0" max="2000000" value="0"/></label>
           <div class="run-buttons"><button class="primary" id="startVideoBtn">Start video</button><button class="danger" id="stopVideoBtn">Stop video</button></div>
+          <label class="field"><span>Export five sharpest sampled frames</span><input id="rankFrames" type="checkbox"/></label>
+          <output class="hint" id="videoReview"></output>
           <div class="hint" id="videoState" role="status">Idle</div>
           <div class="hint" id="highSpeedNote" hidden>High-speed recording uses automatic exposure and phone-only preview. PC live view resumes when recording stops.</div>
         </div>
@@ -108,9 +121,19 @@
           <label class="field"><span>Display stretch <small>preview only</small></span><input id="stretch" type="range" min="0" max="100" value="0" /></label>
           <div class="section-title">Quality</div>
           <div class="quality-card"><span>Current focus</span><strong id="focusBig">0.0</strong><small>Higher is sharper. Use only as a relative metric for the same target/scale.</small></div>
+          <div class="quality-card"><span>Stellar focus · central 96 px</span><strong id="stellarFocus"></strong><small id="stellarReason"></small></div>
+          <canvas id="focusHistory" width="440" height="84" aria-label="Recent contrast measurements"></canvas>
+          <label class="field"><span>Magnify central focus area</span><input id="focusZoom" type="checkbox"/></label>
           <div class="section-title">Processing backend</div>
           <div class="backend"><span>Siril CLI</span><b id="sirilStatus">Not detected</b></div><div class="backend"><span>Captured files</span><b id="fileCount">0</b></div>
           <button class="ghost full" id="sirilBtn">Process current session in Siril</button>
+        </div>
+        <div id="sessionsPanel" hidden>
+          <div class="section-title">Saved sessions</div>
+          <label class="field"><span>Session</span><select id="savedSessions"></select></label>
+          <output id="savedSessionInfo"></output>
+          <button class="primary full" id="resumeSession" disabled>Resume remaining exposures</button>
+          <button class="ghost full" id="refreshSessions">Refresh saved sessions</button>
         </div>
       </aside>
     </section>

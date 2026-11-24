@@ -66,11 +66,17 @@ class CameraController(
     @Volatile private var mediaRecorder: MediaRecorder? = null
     private var recordingFile: File? = null
     private var recordingTimer: Runnable? = null
+    private var videoFPS = 0
+    private var videoFailures = 0
+    private var videoFrames = 0L
+    private var videoRank = false
+    private val videoReview = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Volatile private var recording = false
 
     private var iso = 200
     private var exposureUs = 10_000L
     private var focusDistance = 0.0f
+    private var manualFocus = false
     private var manualEnabled = false
     private var aeLock = false
     private var awbLock = false
@@ -91,7 +97,8 @@ class CameraController(
         val wantsRaw: Boolean,
         val captureId: String,
         val frameType: String,
-        var jpegPath: String? = null,
+        val count: Int,
+        val burstFiles: MutableList<String> = mutableListOf(),
         var rawPath: String? = null,
         var jpegDone: Boolean = false,
         var rawDone: Boolean = false
@@ -136,6 +143,7 @@ class CameraController(
 
     fun shutdown() {
         stop()
+        videoReview.shutdownNow()
         cameraThread.quitSafely()
     }
 
@@ -258,13 +266,14 @@ class CameraController(
             val clampedNs = if (exposureRange != null) requestedNs.coerceIn(exposureRange.lower, exposureRange.upper) else requestedNs
             exposureUs = clampedNs / 1000L
         }
+        if (payload.has("manual_focus")) manualFocus = minFocus > 0 && payload.optBoolean("manual_focus")
         if (payload.has("focus_distance")) {
             focusDistance = payload.optDouble("focus_distance", focusDistance.toDouble()).toFloat().coerceIn(0f, minFocus)
         }
         if (payload.has("ae_lock")) aeLock = payload.optBoolean("ae_lock", aeLock)
         if (payload.has("awb_lock")) awbLock = payload.optBoolean("awb_lock", awbLock)
-        if (payload.has("ois")) oisEnabled = payload.optString("ois", "off") == "on"
-        if (payload.has("eis")) eisEnabled = payload.optString("eis", "off") == "on"
+        if (payload.has("ois")) oisEnabled = (payload.optBoolean("ois") || payload.optString("ois") == "on") && chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.contains(1) == true
+        if (payload.has("eis")) eisEnabled = (payload.optBoolean("eis") || payload.optString("eis") == "on") && chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.contains(1) == true
         if (payload.has("roi_percent")) roiPercent = payload.optInt("roi_percent", roiPercent).coerceIn(25, 100)
         cameraHandler.post { applyRepeatingControls() }
         return controlState()
@@ -274,6 +283,8 @@ class CameraController(
             .put("iso", iso)
             .put("exposure_us", exposureUs)
             .put("focus_distance", focusDistance.toDouble())
+            .put("manual_focus", manualFocus)
+            .put("awb_mode", awbMode)
             .put("manual", manualEnabled)
             .put("ae_lock", aeLock)
             .put("awb_lock", awbLock)
@@ -294,14 +305,18 @@ class CameraController(
         if (wantsRaw && !rawSessionAvailable) {
             return JSONObject().put("ok", false).put("error", "RAW is not available in this camera session")
         }
+        val count = payload.optInt("burst_count", 1)
+        if (count !in 1..16 || (count > 1 && (wantsRaw || !capabilities().optBoolean("burst_capture")))) {
+            return JSONObject().put("ok", false).put("error", "Native burst requires JPEG, BURST_CAPTURE and 2–16 frames")
+        }
         synchronized(captureLock) {
             if (pendingCapture != null) {
                 return JSONObject().put("ok", false).put("error", "A capture is already in progress")
             }
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            pendingCapture = PendingCapture("TOD_$stamp", wantsRaw, payload.optString("capture_id"), payload.optString("frame_type", "Light"), jpegDone = !wantsJpeg, rawDone = !wantsRaw)
+            pendingCapture = PendingCapture("TOD_$stamp", wantsRaw, payload.optString("capture_id"), payload.optString("frame_type", "Light"), count, jpegDone = !wantsJpeg, rawDone = !wantsRaw)
         }
-        cameraHandler.post { performStillCapture(wantsRaw, wantsJpeg) }
+        cameraHandler.post { performStillCapture(wantsRaw, wantsJpeg, count) }
         return JSONObject().put("ok", true).put("status", "capture_started").put("raw", wantsRaw)
     }
 
@@ -316,7 +331,7 @@ class CameraController(
         val bitrate = payload.optInt("bitrate", if (width >= 3840) 80_000_000 else if (width >= 1920) 30_000_000 else 12_000_000)
         cameraHandler.post {
             try {
-                configureRecording(width, height, fps, bitrate, highSpeed, durationMs)
+                configureRecording(width, height, fps, bitrate, highSpeed, durationMs, payload.optBoolean("rank_frames"), payload.optLong("frame_limit").coerceIn(0, 2_000_000))
             } catch (e: Exception) {
                 mediaRecorder?.release()
                 mediaRecorder = null
@@ -336,7 +351,7 @@ class CameraController(
         return JSONObject().put("ok", true).put("status", "video_stopping")
     }
 
-    private fun configureRecording(requestedWidth: Int, requestedHeight: Int, requestedFps: Int, bitrate: Int, highSpeed: Boolean, durationMs: Long) {
+    private fun configureRecording(requestedWidth: Int, requestedHeight: Int, requestedFps: Int, bitrate: Int, highSpeed: Boolean, durationMs: Long, rankFrames: Boolean, frameLimit: Long) {
         val camera = cameraDevice ?: return
         val chars = characteristics ?: return
         val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
@@ -371,7 +386,7 @@ class CameraController(
             setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             setOutputFile(out.absolutePath)
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            setVideoEncodingBitRate(bitrate)
+            setVideoEncodingBitRate(bitrate.coerceIn(1_000_000, 160_000_000))
             setVideoFrameRate(fps)
             setVideoSize(size.width, size.height)
             prepare()
@@ -383,7 +398,33 @@ class CameraController(
         val outputs = mutableListOf<Surface>()
         previewSurface?.let(outputs::add)
         if (!highSpeed) previewReader?.surface?.let(outputs::add)
-        outputs.add(recorder.surface)
+        val encoderSurface = recorder.surface
+        outputs.add(encoderSurface)
+        videoFPS = fps
+        videoFailures = 0
+        videoFrames = 0
+        videoRank = rankFrames
+        var lastReport = 0L
+        val counters = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
+                if (!recording || mediaRecorder !== recorder || !request.targets.contains(encoderSurface)) return
+                videoFrames++
+                if (timestamp - lastReport >= 1_000_000_000L) {
+                    lastReport = timestamp
+                    eventSink(JSONObject().put("event", "video_progress").put("path", out.absolutePath)
+                        .put("camera_frames_started", videoFrames).put("camera_failures", videoFailures))
+                }
+                if (frameLimit > 0L && videoFrames == frameLimit) {
+                    cameraHandler.post { if (mediaRecorder === recorder) stopRecordingInternal() }
+                }
+            }
+            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                if (recording && mediaRecorder === recorder) videoFailures++
+            }
+            override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
+                if (target == encoderSurface && recording && mediaRecorder === recorder) videoFailures++
+            }
+        }
 
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(captureSession: CameraCaptureSession) {
@@ -396,14 +437,14 @@ class CameraController(
                     val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                     previewSurface?.let(builder::addTarget)
                     if (!highSpeed) previewReader?.surface?.let(builder::addTarget)
-                    builder.addTarget(recorder.surface)
+                    builder.addTarget(encoderSurface)
                     builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
                     if (captureSession is CameraConstrainedHighSpeedCaptureSession) {
                         val requests = captureSession.createHighSpeedRequestList(builder.build())
-                        captureSession.setRepeatingBurst(requests, null, cameraHandler)
+                        captureSession.setRepeatingBurst(requests, counters, cameraHandler)
                     } else {
                         applyControls(builder)
-                        captureSession.setRepeatingRequest(builder.build(), null, cameraHandler)
+                        captureSession.setRepeatingRequest(builder.build(), counters, cameraHandler)
                     }
                     recorder.start()
                     recording = true
@@ -455,6 +496,23 @@ class CameraController(
         recording = false
         if (ok && file != null && file.isFile && file.length() > 0) {
             eventSink(JSONObject().put("event", "capture_saved").put("files", JSONArray().put(file.absolutePath)).put("kind", "video"))
+            val fps = videoFPS
+            val failures = videoFailures
+            val rank = videoRank
+            val frames = videoFrames
+            if (started && !videoReview.isShutdown) runCatching {
+                videoReview.execute {
+                    try {
+                        val report = reviewVideo(file, fps, failures, frames, rank)
+                        if (!Thread.currentThread().isInterrupted) {
+                            report.put("event", "video_review").put("path", file.absolutePath)
+                            eventSink(report)
+                        }
+                    } catch (e: Exception) {
+                        eventSink(JSONObject().put("event", "warning").put("message", "Video review failed: ${e.message}"))
+                    }
+                }
+            }
         } else if (file != null) {
             try { file.delete() } catch (_: Exception) {}
             eventSink(JSONObject().put("event", "capture_error").put("message", "Video recording did not finalize correctly"))
@@ -650,15 +708,21 @@ class CameraController(
         if (manualEnabled) {
             builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
             builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
             builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureUs * 1000L)
-            val minFocus = characteristics?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-            if (minFocus > 0f) builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance.coerceIn(0f, minFocus))
         } else {
             builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        }
+        val chars = characteristics
+        val afModes = chars?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+        if (manualFocus && afModes.contains(CaptureRequest.CONTROL_AF_MODE_OFF)) {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+        } else if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        } else if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO)) {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
         }
         builder.set(CaptureRequest.CONTROL_AWB_MODE, awbMode)
         try {
@@ -681,7 +745,7 @@ class CameraController(
         try { builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, if (oisEnabled) CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON else CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF) } catch (_: Exception) {}
     }
 
-    private fun performStillCapture(wantsRaw: Boolean, wantsJpeg: Boolean) {
+    private fun performStillCapture(wantsRaw: Boolean, wantsJpeg: Boolean, count: Int) {
         val camera = cameraDevice ?: return failPending("Camera unavailable")
         val captureSession = session ?: return failPending("Session unavailable")
         try {
@@ -690,7 +754,8 @@ class CameraController(
             if (wantsRaw) rawReader?.surface?.let(builder::addTarget)
             applyControls(builder)
             builder.set(CaptureRequest.JPEG_ORIENTATION, 0)
-            captureSession.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+            val request = builder.build()
+            val callback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                     if (wantsRaw) {
                         synchronized(captureLock) { pendingRawResult = result }
@@ -699,9 +764,19 @@ class CameraController(
                 }
 
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                    if (session !== this@CameraController.session) return
                     failPending("Capture failed: ${failure.reason}")
+                    if (count > 1 && started) configureReadersAndSession(includeRaw = hardwareRawSupported)
                 }
-            }, cameraHandler)
+
+                override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
+                    if (session !== this@CameraController.session) return
+                    failPending("Camera lost an output buffer")
+                    if (started) configureReadersAndSession(includeRaw = hardwareRawSupported)
+                }
+            }
+            if (count == 1) captureSession.capture(request, callback, cameraHandler)
+            else captureSession.captureBurst(List(count) { request }, callback, cameraHandler)
         } catch (e: Exception) {
             failPending(e.message ?: "Capture error")
         }
@@ -717,11 +792,12 @@ class CameraController(
         val bytes = ByteArray(buffer.remaining())
         buffer.get(bytes)
         val pending = synchronized(captureLock) { pendingCapture } ?: return
-        val file = File(captureDir(), "${pending.baseName}.jpg")
+        val suffix = if (pending.count > 1) "_${pending.burstFiles.size + 1}" else ""
+        val file = File(captureDir(), "${pending.baseName}$suffix.jpg")
         FileOutputStream(file).use { it.write(bytes) }
         synchronized(captureLock) {
-            pendingCapture?.jpegPath = file.absolutePath
-            pendingCapture?.jpegDone = true
+            pending.burstFiles.add(file.absolutePath)
+            pending.jpegDone = pending.burstFiles.size == pending.count
         }
         maybeEmitCaptureComplete()
     }
@@ -765,7 +841,7 @@ class CameraController(
         }
         if (done != null) {
             val files = JSONArray()
-            done.jpegPath?.let(files::put)
+            done.burstFiles.forEach(files::put)
             done.rawPath?.let(files::put)
             eventSink(JSONObject().put("event", "capture_saved").put("files", files).put("raw_requested", done.wantsRaw).put("capture_id", done.captureId).put("frame_type", done.frameType))
         }

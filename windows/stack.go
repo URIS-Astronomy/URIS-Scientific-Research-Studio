@@ -9,23 +9,29 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
 // LiveStack combines saved JPEG light frames in a bounded preview buffer.
 // Registration estimates translation against the first accepted image.
 type LiveStack struct {
-	mu        sync.Mutex
-	reference *image.NRGBA
-	sums      [][3]uint64
-	counts    []uint64
-	stats     StackStats
+	mu          sync.Mutex
+	reference   *image.NRGBA
+	sums        [][3]uint64
+	counts      []uint64
+	stats       StackStats
+	calibration *calibration
+	extension   string
 }
 
 type StackStats struct {
-	Accepted      int   `json:"accepted"`
-	Rejected      int   `json:"rejected"`
-	IntegrationUS int64 `json:"integration_us"`
+	Accepted      int         `json:"accepted"`
+	Rejected      int         `json:"rejected"`
+	Histogram     [256]uint64 `json:"histogram"`
+	Calibrated    bool        `json:"calibrated"`
+	IntegrationUS int64       `json:"integration_us"`
 }
 
 func (s *LiveStack) snapshot() StackStats {
@@ -34,27 +40,41 @@ func (s *LiveStack) snapshot() StackStats {
 	return s.stats
 }
 
-func (s *LiveStack) addJPEG(path string, exposureUS int64) error {
+func loadJPEG(path string) (image.Image, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer file.Close()
 	config, err := jpeg.DecodeConfig(file)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if int64(config.Width)*int64(config.Height) > 100_000_000 {
-		return fmt.Errorf("image exceeds the live-stack decoder limit")
+		return nil, fmt.Errorf("image exceeds the live-stack decoder limit")
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
+		return nil, err
 	}
-	img, err := jpeg.Decode(file)
+	return jpeg.Decode(file)
+}
+
+func loadStackFrame(path string) (image.Image, error) {
+	if strings.EqualFold(filepath.Ext(path), ".dng") {
+		return loadDNG(path)
+	}
+	return loadJPEG(path)
+}
+
+func (s *LiveStack) addFrame(path string, exposureUS int64) error {
+	img, err := loadStackFrame(path)
 	if err != nil {
 		return err
 	}
 	frame := stackPreview(img)
+	if err := s.calibration.apply(frame); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.reference == nil {
@@ -72,7 +92,7 @@ func (s *LiveStack) addJPEG(path string, exposureUS int64) error {
 		s.stats.Rejected++
 		return nil
 	}
-	dx, dy, score := translation(s.reference, frame)
+	frame, dx, dy, score := registerStack(s.reference, frame)
 	if score < 0.65 {
 		s.stats.Rejected++
 		return nil
@@ -82,6 +102,9 @@ func (s *LiveStack) addJPEG(path string, exposureUS int64) error {
 		for x := max(0, -dx); x < min(width, width-dx); x++ {
 			i := y*width + x
 			pixel := frame.NRGBAAt(x+dx, y+dy)
+			if pixel.A == 0 {
+				continue
+			}
 			s.sums[i][0] += uint64(pixel.R)
 			s.sums[i][1] += uint64(pixel.G)
 			s.sums[i][2] += uint64(pixel.B)
@@ -89,6 +112,14 @@ func (s *LiveStack) addJPEG(path string, exposureUS int64) error {
 		}
 	}
 	s.stats.Accepted++
+	s.stats.Calibrated = s.calibration != nil && s.calibration.width > 0
+	s.stats.Histogram = [256]uint64{}
+	for i, sum := range s.sums {
+		if count := s.counts[i]; count > 0 {
+			bin := (77*sum[0] + 150*sum[1] + 29*sum[2]) / (256 * count)
+			s.stats.Histogram[bin]++
+		}
+	}
 	s.stats.IntegrationUS += exposureUS
 	return nil
 }
@@ -148,6 +179,50 @@ func translation(reference, frame *image.NRGBA) (int, int, float64) {
 		}
 	}
 	return bestX, bestY, bestScore
+}
+
+// Refine small orientation changes when translation alone gives a weak match.
+func registerStack(reference, frame *image.NRGBA) (*image.NRGBA, int, int, float64) {
+	best := frame
+	dx, dy, score := translation(reference, frame)
+	if score > .93 {
+		return best, dx, dy, score
+	}
+	for _, angle := range []float64{-2, -1, 1, 2} {
+		candidate := rotateStack(frame, angle*math.Pi/180)
+		x, y, quality := translation(reference, candidate)
+		if quality > score+.015 {
+			best, dx, dy, score = candidate, x, y, quality
+		}
+	}
+	return best, dx, dy, score
+}
+
+func rotateStack(frame *image.NRGBA, angle float64) *image.NRGBA {
+	out := image.NewNRGBA(frame.Bounds())
+	width, height := frame.Bounds().Dx(), frame.Bounds().Dy()
+	cx, cy := float64(width-1)/2, float64(height-1)/2
+	sin, cos := math.Sincos(angle)
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			dx, dy := float64(x)-cx, float64(y)-cy
+			fx, fy := dx*cos-dy*sin+cx, dx*sin+dy*cos+cy
+			if fx < 0 || fy < 0 || fx >= float64(width-1) || fy >= float64(height-1) {
+				continue
+			}
+			ix, iy := int(fx), int(fy)
+			u, v := fx-float64(ix), fy-float64(iy)
+			a, b, c, d := frame.PixOffset(ix, iy), frame.PixOffset(ix+1, iy), frame.PixOffset(ix, iy+1), frame.PixOffset(ix+1, iy+1)
+			dst := out.PixOffset(x, y)
+			for ch := 0; ch < 3; ch++ {
+				top := float64(frame.Pix[a+ch])*(1-u) + float64(frame.Pix[b+ch])*u
+				bottom := float64(frame.Pix[c+ch])*(1-u) + float64(frame.Pix[d+ch])*u
+				out.Pix[dst+ch] = byte(math.Round(top*(1-v) + bottom*v))
+			}
+			out.Pix[dst+3] = 255
+		}
+	}
+	return out
 }
 
 func (s *LiveStack) image() *image.NRGBA {

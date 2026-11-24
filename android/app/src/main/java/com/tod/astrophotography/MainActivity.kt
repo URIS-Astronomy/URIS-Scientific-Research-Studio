@@ -171,6 +171,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         toggle("Manual exposure", "manual", manual)
         number("ISO (${caps.optInt("iso_min")}–${caps.optInt("iso_max")})", "iso", manual)
         number("Exposure (µs)", "exposure_us", manual)
+        toggle("Manual focus", "manual_focus", caps.optDouble("min_focus_distance") > 0)
         number("Focus (diopters, 0 = infinity)", "focus_distance", caps.optDouble("min_focus_distance") > 0, true)
         toggle("AE lock", "ae_lock", caps.optBoolean("ae_lock_supported"))
         toggle("AWB lock", "awb_lock", caps.optBoolean("awb_lock_supported"))
@@ -197,6 +198,15 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         val actions = linkedMapOf<String, () -> Unit>()
         actions["JPEG photo"] = { showCommandResult(camera.capture(JSONObject()), "Capturing JPEG…") }
+        if (caps.optBoolean("burst_capture") && !camera.isRecording()) {
+            actions["JPEG burst"] = {
+                val counts = intArrayOf(3, 5, 10, 16)
+                AlertDialog.Builder(this).setTitle("Burst length")
+                    .setItems(counts.map { "$it frames" }.toTypedArray()) { _, index ->
+                        showCommandResult(camera.capture(JSONObject().put("burst_count", counts[index])), "Capturing burst…")
+                    }.setNegativeButton("Cancel", null).show()
+            }
+        }
         if (caps.optBoolean("raw_session_available")) {
             actions["RAW / DNG photo"] = {
                 showCommandResult(camera.capture(JSONObject().put("raw", true).put("jpeg", false)), "Capturing RAW…")

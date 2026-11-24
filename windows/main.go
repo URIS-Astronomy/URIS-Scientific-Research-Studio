@@ -42,16 +42,18 @@ const (
 var webFS embed.FS
 
 type Metrics struct {
-	FPS           float64     `json:"fps"`
-	BitrateMbps   float64     `json:"bitrate_mbps"`
-	FocusScore    float64     `json:"focus_score"`
-	Mean          float64     `json:"mean"`
-	Median        int         `json:"median"`
-	ShadowClip    float64     `json:"shadow_clip"`
-	HighlightClip float64     `json:"highlight_clip"`
-	Histogram     [256]uint64 `json:"histogram"`
-	Frames        uint64      `json:"frames"`
-	Dropped       uint64      `json:"dropped"`
+	Star          *StellarFocus `json:"star,omitempty"`
+	FocusHistory  []float64     `json:"focus_history"`
+	FPS           float64       `json:"fps"`
+	BitrateMbps   float64       `json:"bitrate_mbps"`
+	FocusScore    float64       `json:"focus_score"`
+	Mean          float64       `json:"mean"`
+	Median        int           `json:"median"`
+	ShadowClip    float64       `json:"shadow_clip"`
+	HighlightClip float64       `json:"highlight_clip"`
+	Histogram     [256]uint64   `json:"histogram"`
+	Frames        uint64        `json:"frames"`
+	Dropped       uint64        `json:"dropped"`
 }
 
 type DeviceState struct {
@@ -66,13 +68,16 @@ type DeviceState struct {
 }
 
 type VideoState struct {
-	Recording bool   `json:"recording"`
-	Path      string `json:"path"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	FPS       int    `json:"fps"`
-	StartedAt string `json:"started_at"`
-	Message   string `json:"message"`
+	CameraFrames   int            `json:"camera_frames"`
+	CameraFailures int            `json:"camera_failures"`
+	Review         map[string]any `json:"review,omitempty"`
+	Recording      bool           `json:"recording"`
+	Path           string         `json:"path"`
+	Width          int            `json:"width"`
+	Height         int            `json:"height"`
+	FPS            int            `json:"fps"`
+	StartedAt      string         `json:"started_at"`
+	Message        string         `json:"message"`
 }
 
 type SequenceState struct {
@@ -94,6 +99,7 @@ type SessionState struct {
 	Root          string   `json:"root"`
 	CurrentDir    string   `json:"current_dir"`
 	CapturedFiles []string `json:"captured_files"`
+	SirilStatus   string   `json:"siril_status"`
 	SirilPath     string   `json:"siril_path"`
 }
 
@@ -128,6 +134,8 @@ type App struct {
 	session         SessionState
 	sessionID       string
 	currentControls map[string]any
+	videoSession    string
+	videoSessions   map[string]string
 	stack           *LiveStack
 
 	latestFrame   []byte
@@ -436,10 +444,50 @@ func (a *App) handleEvent(m map[string]any) {
 		a.mu.Lock()
 		a.device.Telemetry = m
 		a.mu.Unlock()
+	case "video_progress":
+		a.mu.Lock()
+		if a.video.Path == fmt.Sprint(m["path"]) {
+			a.video.CameraFrames, _ = asInt(m["camera_frames_started"])
+			a.video.CameraFailures, _ = asInt(m["camera_failures"])
+		}
+		a.mu.Unlock()
+	case "video_review":
+		a.mu.Lock()
+		host := a.device.Host
+		path := fmt.Sprint(m["path"])
+		dir := a.videoSessions[path]
+		delete(a.videoSessions, path)
+		if a.video.Path == fmt.Sprint(m["path"]) {
+			a.video.Review = m
+		}
+		a.mu.Unlock()
+		if dir == "" {
+			return
+		}
+		go func() {
+			appendSessionLog(dir, cloneMap(m))
+			frames, _ := m["best_frames"].([]any)
+			for _, entry := range frames {
+				frame, ok := entry.(map[string]any)
+				if !ok {
+					continue
+				}
+				if _, err := a.fetchFile(host, fmt.Sprint(frame["path"]), filepath.Join(dir, "Best frames"), dir); err != nil {
+					a.setError(err)
+				}
+			}
+		}()
 	case "video_started":
 		a.mu.Lock()
 		a.video.Recording = true
+		a.video.Review = nil
+		a.video.CameraFrames, a.video.CameraFailures = 0, 0
+		a.videoSession = a.ensureSessionDirLocked()
 		a.video.Path = fmt.Sprint(m["path"])
+		if a.videoSessions == nil {
+			a.videoSessions = make(map[string]string)
+		}
+		a.videoSessions[a.video.Path] = a.videoSession
 		a.video.Width, _ = asInt(m["width"])
 		a.video.Height, _ = asInt(m["height"])
 		a.video.FPS, _ = asInt(m["fps"])
@@ -458,6 +506,9 @@ func (a *App) handleEvent(m map[string]any) {
 		a.mu.Lock()
 		host := a.device.Host
 		dir := a.ensureSessionDirLocked()
+		if m["kind"] == "video" && a.videoSession != "" {
+			dir = a.videoSession
+		}
 		frameType, _ := m["frame_type"].(string)
 		if id != "" && id == a.captureID {
 			frameType = a.sequence.FrameType
@@ -487,9 +538,10 @@ func (a *App) handleEvent(m map[string]any) {
 					err = transferErr
 					break
 				}
-				if stack != nil && strings.EqualFold(filepath.Ext(path), ".jpg") {
-					if stackErr := stack.addJPEG(path, int64(exposure)); stackErr != nil {
-						a.setError(stackErr)
+				if stack != nil && strings.EqualFold(filepath.Ext(path), stack.extension) {
+					if stackErr := stack.addFrame(path, int64(exposure)); stackErr != nil {
+						err = stackErr
+						break
 					}
 				}
 			}
@@ -688,7 +740,7 @@ func (a *App) analyzeFrame(b []byte) {
 	for i := 253; i < 256; i++ {
 		high += hist[i]
 	}
-	m := Metrics{Histogram: hist}
+	m := Metrics{Histogram: hist, Star: stellarFocus(img)}
 	if total > 0 {
 		m.Mean = float64(sum) / float64(total)
 		m.Median = median
@@ -699,6 +751,10 @@ func (a *App) analyzeFrame(b []byte) {
 		m.FocusScore = focus / float64(focusN)
 	}
 	a.mu.Lock()
+	m.FocusHistory = append(append([]float64(nil), a.metrics.FocusHistory...), m.FocusScore)
+	if len(m.FocusHistory) > 90 {
+		m.FocusHistory = m.FocusHistory[1:]
+	}
 	m.Frames = a.frameCounter
 	m.FPS = a.metrics.FPS
 	m.BitrateMbps = a.metrics.FPS * float64(len(b)) * 8 / 1e6
@@ -814,6 +870,10 @@ func asInt(v any) (int, bool) {
 }
 
 func (a *App) startSequence(req map[string]any) error {
+	return a.runSequence(req, nil)
+}
+
+func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 	a.mu.Lock()
 	if a.sequence.Running {
 		a.mu.Unlock()
@@ -839,25 +899,53 @@ func (a *App) startSequence(req map[string]any) error {
 	if ft == "" || ft == "<nil>" {
 		ft = "Light"
 	}
-	if mode == "Live Stack" {
-		if jpeg, ok := req["jpeg"].(bool); ft != "Light" || (ok && !jpeg) {
-			a.mu.Unlock()
-			return fmt.Errorf("live stacking requires JPEG light frames")
+	var stack *LiveStack
+	calibrationSelection := map[string]string{}
+	if values, ok := req["calibration"].(map[string]any); ok {
+		for key, value := range values {
+			if id, ok := value.(string); ok {
+				calibrationSelection[key] = id
+			}
 		}
-		a.stack = &LiveStack{}
+	}
+	if resume != nil {
+		calibrationSelection = resume.Calibration
+	}
+	if mode == "Live Stack" {
+		if ft != "Light" {
+			a.mu.Unlock()
+			return fmt.Errorf("live stacking requires light frames")
+		}
+		extension := ".jpg"
+		if raw, _ := req["raw"].(bool); raw {
+			extension = ".dng"
+		}
+		stack = &LiveStack{extension: extension}
+		a.stack = stack
 	}
 	a.session.Target = target
 	a.session.Mode = mode
 	a.sessionID = ""
 	dir := a.ensureSessionDirLocked()
 	controls := cloneMap(a.currentControls)
+	completed := 0
+	if resume != nil {
+		dir, _ = sessionPath(a.session.Root, resume.ID)
+		a.session.CurrentDir, a.sessionID = dir, filepath.Base(dir)
+		controls = cloneMap(resume.Controls)
+		completed = resume.State.Completed
+	}
 	capabilities := cloneMap(a.device.Capabilities)
 	telemetry := cloneMap(a.device.Telemetry)
 	exposure, _ := asInt(controls["exposure_us"])
 	if controls["manual"] != true {
 		exposure = 0
 	}
-	a.sequence = SequenceState{Running: true, Target: target, Mode: mode, FrameType: ft, Requested: count, IntervalMs: interval, StartedAt: time.Now().Format(time.RFC3339), Message: "Capturing"}
+	a.sequence = SequenceState{Running: true, Target: target, Mode: mode, FrameType: ft, Requested: count, Completed: completed, IntervalMs: interval, StartedAt: time.Now().Format(time.RFC3339), Message: "Capturing"}
+	if resume != nil {
+		a.sequence.IntegrationUS = resume.State.IntegrationUS
+		a.sequence.StartedAt = resume.State.StartedAt
+	}
 	cancel := make(chan struct{})
 	a.sequenceCancel = cancel
 	a.mu.Unlock()
@@ -867,11 +955,17 @@ func (a *App) startSequence(req map[string]any) error {
 		jpeg = v
 	}
 	go func() {
-		appendSessionLog(dir, map[string]any{
-			"event": "sequence_started", "target": target, "mode": mode, "frame_type": ft,
-			"requested": count, "interval_ms": interval, "controls": controls,
-			"capabilities": capabilities, "telemetry": telemetry, "raw": raw, "jpeg": jpeg,
-		})
+		if resume == nil {
+			appendSessionLog(dir, map[string]any{
+				"event": "sequence_started", "target": target, "mode": mode, "frame_type": ft,
+				"requested": count, "interval_ms": interval, "controls": controls,
+				"capabilities": capabilities, "telemetry": telemetry, "raw": raw, "jpeg": jpeg,
+				"calibration": req["calibration"],
+			})
+		} else {
+			appendSessionLog(dir, map[string]any{"event": "sequence_resumed", "completed": completed})
+		}
+
 		defer func() {
 			a.mu.Lock()
 			a.sequence.Running = false
@@ -884,7 +978,29 @@ func (a *App) startSequence(req map[string]any) error {
 			appendSessionLog(dir, map[string]any{"event": "sequence_finished", "sequence": sequence,
 				"received_preview_frames": metrics.Frames, "telemetry": telemetry})
 		}()
-		for i := 0; i < count; i++ {
+		if stack != nil {
+			master, err := loadCalibration(a.session.Root, calibrationSelection, stack.extension)
+			if err != nil {
+				a.setError(err)
+				a.mu.Lock()
+				a.sequence.Message = "Calibration failed"
+				a.mu.Unlock()
+				return
+			}
+			stack.calibration = master
+			if resume != nil {
+				entries, _ := os.ReadDir(filepath.Join(dir, "Light"))
+				for _, entry := range entries {
+					if strings.EqualFold(filepath.Ext(entry.Name()), stack.extension) {
+						if err := stack.addFrame(filepath.Join(dir, "Light", entry.Name()), int64(exposure)); err != nil {
+							a.setError(err)
+						}
+					}
+				}
+			}
+		}
+
+		for i := completed; i < count; i++ {
 			select {
 			case <-cancel:
 				a.mu.Lock()
@@ -901,6 +1017,18 @@ func (a *App) startSequence(req map[string]any) error {
 				}
 				a.mu.Unlock()
 				return
+			}
+			if resume != nil && i == completed && len(controls) > 0 {
+				if _, err := a.command("set_controls", controls, 5*time.Second); err != nil {
+					a.setError(err)
+					a.mu.Lock()
+					a.sequence.Message = "Could not restore camera settings"
+					a.mu.Unlock()
+					return
+				}
+				a.mu.Lock()
+				a.currentControls = controls
+				a.mu.Unlock()
 			}
 			id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)
 			a.mu.Lock()
@@ -1156,6 +1284,37 @@ func (a *App) routes() http.Handler {
 		a.stopSequence()
 		writeJSON(w, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("GET /api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, sessionIndex(a.session.Root))
+	})
+	mux.HandleFunc("POST /api/sessions/resume", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID string `json:"id"`
+		}
+		if json.NewDecoder(r.Body).Decode(&request) != nil {
+			writeErr(w, "Missing session")
+			return
+		}
+		dir, ok := sessionPath(a.session.Root, request.ID)
+		if !ok {
+			writeErr(w, "Invalid session")
+			return
+		}
+		record := readSession(filepath.Join(dir, "session.jsonl"), request.ID)
+		from := record.State
+		if from.Requested <= from.Completed {
+			writeErr(w, "No unfinished exposures for this session")
+			return
+		}
+		payload := map[string]any{"target": from.Target, "mode": from.Mode, "frame_type": from.FrameType,
+			"count": from.Requested, "interval_ms": from.IntervalMs, "raw": record.Raw, "jpeg": record.JPEG,
+			"calibration": record.Calibration}
+		if err := a.runSequence(payload, &record); err != nil {
+			writeErr(w, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
 	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
 		var p map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&p)
@@ -1184,74 +1343,31 @@ func (a *App) routes() http.Handler {
 		_ = exec.Command("explorer.exe", dir).Start()
 		writeJSON(w, map[string]any{"ok": true})
 	})
-	mux.HandleFunc("/api/siril", func(w http.ResponseWriter, r *http.Request) {
-		a.mu.RLock()
-		p := a.session.SirilPath
-		dir := a.session.CurrentDir
-		a.mu.RUnlock()
-		if p == "" {
-			writeErr(w, "Siril CLI not detected")
+	mux.HandleFunc("POST /api/siril", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Calibration map[string]string `json:"calibration"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		a.mu.Lock()
+		executable, dir, root := a.session.SirilPath, a.session.CurrentDir, a.session.Root
+		if executable == "" || a.session.SirilStatus == "Processing" {
+			a.mu.Unlock()
+			writeErr(w, "Siril is missing or already processing")
 			return
 		}
-		dir = filepath.Join(dir, "Light")
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			writeErr(w, "Capture light frames before processing")
-			return
-		}
-		processed := filepath.Join(dir, "Processed")
-		if err := os.MkdirAll(processed, 0755); err != nil {
-			writeErr(w, err.Error())
-			return
-		}
-		hasRaw := false
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			ext := strings.ToLower(filepath.Ext(e.Name()))
-			if ext == ".dng" || ext == ".cr2" || ext == ".cr3" || ext == ".nef" || ext == ".arw" {
-				hasRaw = true
-				break
-			}
-		}
-		script := filepath.Join(dir, "TOD_AutoStack.ssf")
-		var b strings.Builder
-		b.WriteString("requires 1.4.4\n")
-		if hasRaw {
-			b.WriteString("convertraw todseq -debayer -fitseq -out=Processed\n")
-		} else {
-			b.WriteString("convert todseq -fitseq -out=Processed\n")
-		}
-		b.WriteString("cd Processed\n")
-		b.WriteString("register todseq -2pass\n")
-		b.WriteString("seqapplyreg todseq -prefix=r_ -framing=min\n")
-		b.WriteString("stack r_todseq rej w 3 3 -norm=addscale -out=TOD_Stacked\n")
-		if err := os.WriteFile(script, []byte(b.String()), 0644); err != nil {
-			writeErr(w, err.Error())
-			return
-		}
-		logPath := filepath.Join(processed, "TOD_Siril_Process.log")
-		logFile, _ := os.Create(logPath)
-		cmd := exec.Command(p, "-d", dir, "-s", script)
-		if logFile != nil {
-			cmd.Stdout = logFile
-			cmd.Stderr = logFile
-		}
-		if err := cmd.Start(); err != nil {
-			if logFile != nil {
-				_ = logFile.Close()
-			}
-			writeErr(w, err.Error())
-			return
-		}
+		a.session.SirilStatus = "Processing"
+		a.mu.Unlock()
 		go func() {
-			_ = cmd.Wait()
-			if logFile != nil {
-				_ = logFile.Close()
+			status := "Complete"
+			if err := runSiril(executable, root, dir, request.Calibration); err != nil {
+				status = "Failed"
+				a.setError(err)
 			}
+			a.mu.Lock()
+			a.session.SirilStatus = status
+			a.mu.Unlock()
 		}()
-		writeJSON(w, map[string]any{"ok": true, "path": p, "script": script, "output": processed})
+		writeJSON(w, map[string]any{"ok": true})
 	})
 	return withHeaders(mux)
 }

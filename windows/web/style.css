@@ -3,3 +3,10 @@
 
 [hidden] { display: none !important; }
 #cameraDetails { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+#focusHistory { width: 100%; height: 65px; background: #0d1524; border: 1px solid #273750; border-radius: 5px; margin-top: .65rem; }
+#sessionsPanel { padding: 1rem; min-height: 14rem; }
+#sessionsPanel output, #videoReview { display: block; margin: .35rem 0 .75rem; color: #aebfd9; }
+#savedSessions { max-width: 100%; }
+.viewer.focus-zoom #preview, .viewer.focus-zoom #analysisOverlay { transform: scale(2.5); }
+button:disabled { cursor: default; opacity: .55; }
