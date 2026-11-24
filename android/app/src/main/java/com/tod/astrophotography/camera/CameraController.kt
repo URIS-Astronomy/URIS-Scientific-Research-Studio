@@ -359,6 +359,8 @@ class CameraController(
             .put("roi_percent", roiPercent).put("display_zoom",zoom)
             .apply { processing.forEach { (key, value) -> put(key,value) } }
 
+    fun focusSettings(): JSONObject = JSONObject().put("manual_focus",manualFocus).put("focus_distance",focusDistance.toDouble())
+
     fun isRecording(): Boolean = recording
 
     fun capture(payload: JSONObject): JSONObject {

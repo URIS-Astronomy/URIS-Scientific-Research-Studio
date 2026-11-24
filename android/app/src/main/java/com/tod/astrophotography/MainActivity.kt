@@ -316,6 +316,10 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 for ((name, delta) in listOf("−" to -1, "Infinity" to null, "+" to 1)) {
                     addView(Button(this@MainActivity).apply { text = name; setOnClickListener { move(delta) } })
                 }
+                addView(Button(this@MainActivity).apply {
+                    text = "Auto"
+                    setOnClickListener { camera.setControls(JSONObject().put("manual_focus",false)) }
+                })
             })
         }
         toggle("AE lock", "ae_lock", caps.optBoolean("ae_lock_supported"))
@@ -428,6 +432,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             .put("recording", cameraController?.isRecording() == true)
             .put("display_zoom",cameraController?.previewZoom() ?: 1.0)
             .put("effective",cameraController?.measured() ?: JSONObject())
+            .put("focus_settings",cameraController?.focusSettings() ?: JSONObject())
             .put("usb_power", (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0)
             .put("preview_frames", cameraController?.previewFrames?.get() ?: 0)
             .put("battery_percent", battery)

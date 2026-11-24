@@ -97,7 +97,10 @@ function refreshPreview() {
   }
   setTimeout(refreshPreview, 100);
 }
-function postControls(){const processing = Object.fromEntries([...document.querySelectorAll('#processingControls select')].filter(x=>x.value!=='').map(x=>[x.name,+x.value]));const rv=$('roi').value;const rp=rv==='75%'?75:rv==='50%'?50:rv==='25%'?25:100;return api('/api/controls',{...processing,manual:$('manualToggle').checked,iso:+$('iso').value,exposure_us:+$('exposure').value,focus_distance:+$('focus').value,manual_focus:$('manualFocus').checked,ae_lock:$('aeLock').checked,awb_lock:$('awbLock').checked,ois:$('ois').value,eis:$('eis').value,roi_percent:rp,fixed_color:$('fixedColor').checked,awb_mode:+$('awbMode').value||1})}
+let focusEdited=false;
+$('manualFocus').onchange=()=>{focusEdited=true;};
+$('focus').oninput=()=>{focusEdited=true;};
+function postControls(){const processing = Object.fromEntries([...document.querySelectorAll('#processingControls select')].filter(x=>x.value!=='').map(x=>[x.name,+x.value]));const rv=$('roi').value;const rp=rv==='75%'?75:rv==='50%'?50:rv==='25%'?25:100;return api('/api/controls',{...processing,manual:$('manualToggle').checked,iso:+$('iso').value,exposure_us:+$('exposure').value,...((focusEdited && !$('manualFocus').disabled) ? {focus_distance:+$('focus').value,manual_focus:$('manualFocus').checked} : {}),ae_lock:$('aeLock').checked,awb_lock:$('awbLock').checked,ois:$('ois').value,eis:$('eis').value,roi_percent:rp,fixed_color:$('fixedColor').checked,awb_mode:+$('awbMode').value||1}).then(response=>{focusEdited=false;return response;})}
 function currentMode(){return document.querySelector('.nav.active')?.dataset.mode||'Capture'}
 function saveSession(){return api('/api/session',{target:$('targetInput').value,mode:currentMode()})}
 function parseVideoMode(){const t=$('fpsMode').value||'';const m=t.match(/(\d+)[×x](\d+).*?(\d+)(?:-\d+)?\s*fps/i);return m?{width:+m[1],height:+m[2],fps:+m[3],high_speed:t.endsWith(' • HS')}:null}
@@ -111,7 +114,7 @@ function applyProfile(){const p=$('profile').value,c=state?.device?.capabilities
   $('iso').value=clamp(['Sun','Moon'].includes(p) ? c.iso_min || preset.iso : preset.iso,c.iso_min,c.iso_max);
   $('exposure').value=clamp(p==='Deep Sky' ? c.exposure_us_max || preset.exp : preset.exp,c.exposure_us_min,c.exposure_us_max);
   if(c.manual_sensor) $('manualToggle').checked=true;
-  if(c.min_focus_distance>0) $('manualFocus').checked=true;
+  if(c.min_focus_distance>0) { $('manualFocus').checked=true; focusEdited=true; }
   if(['Jupiter','Saturn','Mars','Venus'].includes(p)) {
     const supported=[...$('fpsMode').options].map(option=>({
       value:option.value, match:option.value.match(/^(\d+)×(\d+) @ (\d+) fps$/)
@@ -355,6 +358,11 @@ function renderImaging(s) {
   $('effectiveExposure').textContent=measured.iso != null && measured.exposure_us != null ?
       `Measured ISO ${measured.iso} · ${n(measured.exposure_us,2)} µs${measured.active_physical_id==null?'':` · active camera ${measured.active_physical_id}`}` : '';
   $('effectiveStabilization').textContent=[measured.ois==null?'':('OIS '+(measured.ois?'on':'off')),measured.eis==null?'':('EIS '+(measured.eis?'on':'off'))].filter(Boolean).join(' · ');
+  const focusSettings=t.focus_settings || c.capture_settings || {};
+  if(!focusEdited && typeof focusSettings.manual_focus==='boolean') {
+    $('manualFocus').checked=focusSettings.manual_focus;
+    if(Number.isFinite(focusSettings.focus_distance)) $('focus').value=focusSettings.focus_distance.toFixed(3);
+  }
   const focusAvailable = Boolean(c.min_focus_distance > 0) && !$('applyBtn').disabled;
   $('focusSlider').disabled=!focusAvailable;
   $('focusSlider').max=c.min_focus_distance || 0;
@@ -386,6 +394,7 @@ let focusTimer;
 function moveFocus(distance) {
   const max=state?.device?.capabilities?.min_focus_distance || 0;
   const value=Math.min(max,Math.max(0,distance));
+  focusEdited=true;
   $('focus').value=value.toFixed(3);
   $('focusSlider').value=value;
   $('manualFocus').checked=true;
