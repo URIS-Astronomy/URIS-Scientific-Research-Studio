@@ -33,10 +33,11 @@ jobs:
           import struct
           import subprocess
           import time
+          import xml.etree.ElementTree as ET
           
           
           def adb(*args):
-              return subprocess.check_output(["adb", *args], text=True).strip()
+              return subprocess.check_output(["adb", *args], text=True, timeout=20).strip()
           
           
           def open_socket(port):
@@ -146,6 +147,22 @@ jobs:
               raise AssertionError(f"expected frame {expected}, received {shape}")
           
           
+          def choose_exit_button(label):
+              adb("shell", "input", "keyevent", "4")
+              for _ in range(4):
+                  adb("shell", "uiautomator", "dump", "/sdcard/tod-window.xml")
+                  root = ET.fromstring(adb("shell", "cat", "/sdcard/tod-window.xml"))
+                  nodes = list(root.iter("node"))
+                  if not any(node.get("text") == "Exit TOD Astro Photography?" for node in nodes):
+                      time.sleep(.2)
+                      continue
+                  button = next(node for node in nodes if node.get("text", "").upper() == label)
+                  x0, y0, x1, y1 = map(int, re.findall(r"\d+", button.get("bounds", "")))
+                  adb("shell", "input", "tap", str((x0+x1)//2), str((y0+y1)//2))
+                  return
+              raise AssertionError("Android exit confirmation did not appear")
+          
+          
           app = "com.tod.astrophotography"
           for host, phone in ((14700, 47000), (14701, 47001), (14702, 47002)):
               adb("forward", f"tcp:{host}", f"tcp:{phone}")
@@ -250,10 +267,48 @@ jobs:
                   print("Native emulator H.264 recording started, stopped, and transferred:", width, height, fps, len(mp4), flush=True)
               else:
                   print("Emulator camera did not advertise standard video mode", flush=True)
+          
+              for _ in range(30):
+                  ready_caps = control.call("capabilities", allow_error=True)
+                  if ready_caps.get("ok"):
+                      break
+                  time.sleep(.25)
+              assert ready_caps.get("ok"), ready_caps
+              maximum = int(ready_caps.get("exposure_us_max", 0))
+              if ready_caps.get("manual_sensor") and maximum >= 1_000_000:
+                  target = min(2_000_000, maximum)
+                  desired = {"profile": "astronomy", "manual": True, "iso": int(ready_caps["iso_min"]), "exposure_us": target}
+                  actual = control.call("set_controls", desired)
+                  assert abs(actual["exposure_us"] - target) <= 1, actual
+                  cancelled = "emulator-long-cancel"
+                  control.call("capture", {"capture_id": cancelled, "jpeg": True})
+                  control.call("cancel_capture", {"capture_id": cancelled})
+                  for _ in range(30):
+                      ready_caps = control.call("capabilities", allow_error=True)
+                      if ready_caps.get("ok"):
+                          break
+                      time.sleep(.25)
+                  assert ready_caps.get("ok"), ready_caps
+                  restarted = "emulator-long-restart"
+                  start = time.monotonic()
+                  control.call("capture", {"capture_id": restarted, "jpeg": True})
+                  long_jpeg = control.event("capture_saved", "capture_id", restarted)
+                  assert len(long_jpeg["files"]) == 1
+                  print("Native emulator cancelled and restarted a long exposure:", target, "microseconds requested,",
+                        round(time.monotonic()-start, 2), "seconds until transfer was available", flush=True)
+                  control.call("set_controls", {"manual": False})
+              else:
+                  print("Emulator camera did not advertise a one-second manual exposure", flush=True)
+          
+              choose_exit_button("CANCEL")
+              control.call("ping")
+              choose_exit_button("EXIT")
+              while control.socket.recv(65536):
+                  pass
+              print("Android exit confirmation offered cancellation and released the control socket on Exit", flush=True)
           finally:
               control.close()
           
-          adb("shell", "am", "force-stop", app)
           adb("shell", "am", "start", "-W", "-n", app + "/.MainActivity")
           control, _ = app_ready()
           try:
