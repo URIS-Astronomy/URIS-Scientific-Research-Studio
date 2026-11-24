@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class AstroServer(
     private val commandHandler: CommandHandler,
-    private val connectionListener: (Boolean) -> Unit
+    private val deviceId: String,
+    private val connectionListener: (String?) -> Unit
 ) {
     interface CommandHandler {
         fun capabilities(): JSONObject
@@ -28,6 +29,7 @@ class AstroServer(
         fun stopVideo(): JSONObject
         fun ping(): JSONObject
         fun telemetry(): JSONObject
+        fun isRecording(): Boolean
         fun resolveCapturedFile(path: String): File?
     }
 
@@ -44,7 +46,11 @@ class AstroServer(
     @Volatile private var fileServer: ServerSocket? = null
     @Volatile private var discoverySocket: DatagramSocket? = null
     private val clients = ConcurrentHashMap.newKeySet<Socket>()
-    private data class ControlLink(val socket: Socket, val messages: ArrayBlockingQueue<String> = ArrayBlockingQueue(64))
+    private data class ControlLink(
+        val socket: Socket,
+        val messages: ArrayBlockingQueue<String> = ArrayBlockingQueue(64),
+        var clientSession: String = ""
+    )
     @Volatile private var controlLink: ControlLink? = null
     private val previewQueue = ArrayBlockingQueue<ByteArray>(1)
 
@@ -65,7 +71,7 @@ class AstroServer(
         clients.forEach { runCatching { it.close() } }
         controlLink = null
         previewQueue.clear()
-        connectionListener(false)
+        connectionListener(null)
     }
 
     fun offerPreviewFrame(jpeg: ByteArray) {
@@ -103,12 +109,12 @@ class AstroServer(
             controlServer = ServerSocket(CONTROL_PORT).apply { reuseAddress = true }
             while (running.get()) {
                 val socket = try { controlServer?.accept() } catch (_: Exception) { null } ?: break
-                if (register(socket)) handleControlClient(socket)
+                if (register(socket)) Thread({ handleControlClient(socket) }, "TOD-Control-Client").start()
             }
         } catch (_: Exception) {
         } finally {
             runCatching { controlServer?.close() }
-            connectionListener(false)
+            connectionListener(null)
         }
     }
 
@@ -119,7 +125,7 @@ class AstroServer(
         val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
         val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
         val link = ControlLink(socket)
-        controlLink = link
+        var activated = false
         val sender = Thread({
             try {
                 while (running.get() && !socket.isClosed) {
@@ -132,20 +138,47 @@ class AstroServer(
             } finally { closeClient(socket) }
         }, "TOD-Control-Writer")
         sender.start()
-        connectionListener(true)
         try {
             while (running.get() && !socket.isClosed) {
                 val line = reader.readLine() ?: break
-                val response = try { route(JSONObject(line)) }
-                catch (e: Exception) { JSONObject().put("ok", false).put("error", e.message ?: "Invalid command") }
+                var requestId = ""
+                val response = try {
+                    val request = JSONObject(line)
+                    requestId = request.optString("id")
+                    val command = request.optString("cmd")
+                    if (command != "probe" && !activated) {
+                        if (command != "hello") break
+                        synchronized(this) {
+                            val previous = controlLink
+                            val payload = request.optJSONObject("payload")
+                            link.clientSession = payload?.optString("client_session").orEmpty()
+                            if (previous != null && previous.socket !== socket && !previous.socket.isClosed &&
+                                (link.clientSession.isEmpty() || previous.clientSession != link.clientSession)) {
+                                throw IllegalStateException("Another PC is already connected")
+                            }
+                            controlLink = link
+                            activated = true
+                            val usb = socket.inetAddress.isLoopbackAddress && payload?.optString("transport") == "USB"
+                            connectionListener(if (usb) "USB" else "LAN")
+                            previous?.takeIf { it.socket !== socket }?.let { closeClient(it.socket) }
+                        }
+                    }
+                    if (activated && controlLink !== link) break
+                    route(request)
+                }
+                catch (e: Exception) { JSONObject().put("id", requestId).put("ok", false).put("error", e.message ?: "Invalid command") }
                 enqueue(link, response.toString())
             }
         } catch (_: Exception) {
         } finally {
-            controlLink = null
+            synchronized(this) {
+                if (controlLink === link) {
+                    controlLink = null
+                    connectionListener(null)
+                }
+            }
             closeClient(socket)
             sender.interrupt()
-            connectionListener(false)
         }
     }
 
@@ -154,7 +187,8 @@ class AstroServer(
         val command = request.optString("cmd", "")
         val payload = request.optJSONObject("payload") ?: JSONObject()
         val body = when (command) {
-            "hello" -> JSONObject().put("ok", true).put("app", "TOD Astro Photography").put("protocol", 2).put("file_port", FILE_PORT)
+            "hello", "probe" -> JSONObject().put("ok", true).put("app", "TOD Astro Photography").put("protocol", 2)
+                .put("device_id", deviceId).put("recording", commandHandler.isRecording())
             "ping" -> commandHandler.ping()
             "capabilities" -> commandHandler.capabilities()
             "telemetry" -> commandHandler.telemetry()

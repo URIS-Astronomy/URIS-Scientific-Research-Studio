@@ -62,8 +62,26 @@ jobs:
           node --check web/overlay.js
       - name: Build Windows GUI
         run: go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../TOD_Astro_Suite.exe .
+      - name: Bundle USB transport
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "tod-platform-tools.zip"
+          $unpacked = Join-Path $env:RUNNER_TEMP "tod-platform-tools"
+          $bundle = Join-Path $env:GITHUB_WORKSPACE "TOD-Astro-Suite-Windows"
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools_r37.0.3-win.zip" -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne "89d108360a3bf2924d3bea837239edaccc22fd6ff5befd3787c4348a9fe4f09d") {
+            throw "Android platform-tools checksum mismatch"
+          }
+          Expand-Archive $archive $unpacked
+          New-Item -ItemType Directory -Path "$bundle/platform-tools" -Force | Out-Null
+          Copy-Item ../TOD_Astro_Suite.exe $bundle
+          foreach ($file in "adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "NOTICE.txt", "source.properties") {
+            Copy-Item "$unpacked/platform-tools/$file" "$bundle/platform-tools/"
+          }
+          & "$bundle/platform-tools/adb.exe" version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: TOD-Astro-Suite-Windows
-          path: TOD_Astro_Suite.exe
+          path: TOD-Astro-Suite-Windows/
           if-no-files-found: error

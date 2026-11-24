@@ -20,7 +20,7 @@
       <button class="nav" data-mode="Sessions"><span>≡</span><b>Sessions</b></button>
     </nav>
     <div class="side-bottom">
-      <div class="device-mini"><div class="dot offline" id="sideDot"></div><div><b id="sideStatus">PHONE OFFLINE</b><small id="sideHost">Auto discovery active</small></div></div>
+      <div class="device-mini"><div class="dot offline" id="sideDot"></div><div><b id="sideStatus">Offline</b><small id="sideHost">Looking for a USB phone</small></div></div>
       <button class="ghost full" id="reconnectBtn">Reconnect phone</button>
     </div>
   </aside>
@@ -29,7 +29,7 @@
       <div><h1 id="pageTitle">Capture</h1><p id="pageHint">Live telescope feed and camera control</p></div>
       <div class="top-actions">
         <div class="target-box"><span>Target</span><input id="targetInput" value="Jupiter"/></div>
-        <div class="status-pill offline" id="statusPill"><span class="dot"></span><b id="statusText">PHONE OFFLINE</b></div>
+        <div class="status-pill offline" id="statusPill"><span class="dot"></span><b id="statusText">Offline</b></div>
       </div>
     </header>
 
@@ -41,7 +41,7 @@
         </div>
         <div class="viewer" id="viewer">
           <img id="preview" alt="Live telescope feed"/>
-          <div id="offlineState" class="offline-state"><div class="scope-icon">◉</div><h2>Waiting for TOD Astro Photography</h2><p>Open the phone app on your Vivo T3 Ultra. The live telescope feed will appear automatically.</p><div class="manual-connect"><input id="manualIp" placeholder="Phone IP (optional)"/><button id="manualConnectBtn">Connect</button></div></div>
+          <div id="offlineState" class="offline-state"><div class="scope-icon">◉</div><h2>Waiting for TOD Astro Photography</h2><p>Connect the phone with a USB data cable, enable USB debugging, and open TOD Astro Photography.</p><p id="usbHint" role="status"></p><details class="manual-connect"><summary>Manual LAN pairing</summary><input id="manualIp" aria-label="Phone IP" placeholder="Phone IP"/><button id="manualConnectBtn">Connect over LAN</button></details></div>
           <div class="crosshair" id="crosshair"><i></i><i></i><span></span></div>
           <canvas class="analysis-overlay" id="analysisOverlay"></canvas><div class="clip-overlay" id="clipOverlay"></div>
           <div class="viewer-badges"><span id="resBadge">—</span><span id="fpsBadge">0.0 FPS</span><span id="bitrateBadge">0.0 Mb/s</span></div>

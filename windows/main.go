@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"embed"
 	"encoding/binary"
@@ -57,6 +58,8 @@ type Metrics struct {
 }
 
 type DeviceState struct {
+	Transport    string         `json:"transport"`
+	USB          usbStatus      `json:"usb"`
 	Connected    bool           `json:"connected"`
 	Host         string         `json:"host"`
 	Status       string         `json:"status"`
@@ -126,17 +129,28 @@ type captureResult struct {
 }
 
 type App struct {
-	mu              sync.RWMutex
-	device          DeviceState
-	metrics         Metrics
-	video           VideoState
-	sequence        SequenceState
-	session         SessionState
-	sessionID       string
-	currentControls map[string]any
-	videoSession    string
-	videoSessions   map[string]string
-	stack           *LiveStack
+	active           endpoint
+	phoneID          string
+	clientSession    string
+	linkChanged      chan struct{}
+	knownLAN         string
+	manualLAN        string
+	lanPath          string
+	usb              *adbTunnel
+	discover         func() string
+	discoveryDone    chan struct{}
+	captureTransfers map[string]bool
+	mu               sync.RWMutex
+	device           DeviceState
+	metrics          Metrics
+	video            VideoState
+	sequence         SequenceState
+	session          SessionState
+	sessionID        string
+	currentControls  map[string]any
+	videoSession     string
+	videoSessions    map[string]string
+	stack            *LiveStack
 
 	latestFrame   []byte
 	frameETag     string
@@ -154,7 +168,6 @@ type App struct {
 	captureDone    chan captureResult
 	captureID      string
 	sequenceCancel chan struct{}
-	connecting     atomic.Bool
 	uiSeen         atomic.Bool
 	lastUI         atomic.Int64
 	quitApp        chan struct{}
@@ -163,8 +176,13 @@ type App struct {
 func newApp() *App {
 	pictures := filepath.Join(userHome(), "Pictures", "TOD Astro Photography")
 	_ = os.MkdirAll(pictures, 0755)
+	path := lanPreferencePath()
+	var clientKey [16]byte
+	_, _ = rand.Read(clientKey[:])
 	a := &App{
-		device:   DeviceState{Status: "Waiting for TOD Astro Photography", Capabilities: map[string]any{}, Telemetry: map[string]any{}},
+		linkChanged: make(chan struct{}), discoveryDone: make(chan struct{}), captureTransfers: make(map[string]bool),
+		lanPath: path, knownLAN: loadLANPreference(path), discover: discoverPhone, usb: bundledADB(), clientSession: hex.EncodeToString(clientKey[:]),
+		device:   DeviceState{Transport: "Offline", Status: "Waiting for TOD Astro Photography", Capabilities: map[string]any{}, Telemetry: map[string]any{}},
 		video:    VideoState{Message: "Idle"},
 		sequence: SequenceState{Mode: "Planetary", FrameType: "Light", Message: "Idle"},
 		session:  SessionState{Target: "Jupiter", Mode: "Planetary", Root: pictures, CurrentDir: pictures, SirilPath: detectSiril()},
@@ -234,31 +252,110 @@ func (a *App) setError(err error) {
 }
 
 func (a *App) discoveryLoop() {
+	defer close(a.discoveryDone)
+	if a.usb != nil {
+		defer a.usb.close()
+	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-a.stop:
 			return
+		default:
+		}
+		a.refreshTransport()
+		select {
+		case <-a.stop:
+			return
 		case <-ticker.C:
 		case <-a.reconnect:
 		}
-		a.mu.RLock()
-		connected := a.device.Connected
-		needsCaps := len(a.device.Capabilities) == 0
-		a.mu.RUnlock()
-		if connected {
-			if _, err := a.command("ping", nil, 3*time.Second); err != nil {
-				a.disconnect("Phone connection timed out")
-			} else if needsCaps {
-				a.queryCapabilities()
+	}
+}
+
+func (a *App) refreshTransport() {
+	var wired endpoint
+	info := usbStatus{"unavailable", "USB components are missing. Extract the entire Windows download before opening the app."}
+	if a.usb != nil {
+		serial, status := a.usb.detect()
+		info = status
+		if serial != "" {
+			var err error
+			wired, err = a.usb.forwards(serial)
+			if err != nil {
+				info = usbStatus{"reconnecting", "Could not open the USB camera connection. Reconnecting…"}
 			}
-			continue
-		}
-		if host := discoverPhone(); host != "" {
-			go a.connect(host)
+		} else if a.usb.link.serial != "" && (status.State == "unavailable" || status.State == "multiple") {
+			wired = a.usb.link.endpoint
+		} else if a.usb.link.serial != "" {
+			a.usb.close()
+			if status.State == "no_data" {
+				info = usbStatus{"lost", "USB connection lost. Reconnect the phone with a USB data cable."}
+			}
 		}
 	}
+	a.mu.RLock()
+	active, connected := a.active, a.device.Connected
+	needsCaps := len(a.device.Capabilities) == 0
+	busy := a.captureID != "" || a.video.Recording || a.video.Message == "Starting"
+	known, manual := a.knownLAN, a.manualLAN
+	usbPower, _ := a.device.Telemetry["usb_power"].(bool)
+	a.mu.RUnlock()
+	if info.State == "no_data" && usbPower {
+		info = usbStatus{"power_only", "The phone reports USB power, but Windows sees no Android USB data. Try a USB data cable and another port."}
+	}
+	a.setUSBStatus(info)
+	if connected && (active.kind != transportUSB || active == wired) {
+		if _, err := a.command("ping", nil, 2*time.Second); err == nil {
+			if active.kind == transportUSB {
+				a.setUSBStatus(usbStatus{"connected", "USB debugging authorized · PC connected"})
+			} else if wired.control != 0 && !busy {
+				a.setUSBStatus(usbStatus{"connecting", "USB authorized. Connecting to the phone app…"})
+				if a.connectEndpoint(wired) {
+					a.setUSBStatus(usbStatus{"connected", "USB debugging authorized · PC connected"})
+					return
+				}
+				a.resetFailedUSB(info)
+			}
+			if needsCaps {
+				a.queryCapabilities()
+			}
+			return
+		}
+	}
+	if connected {
+		a.disconnect("Phone connection lost")
+	}
+	if wired.control != 0 {
+		a.setUSBStatus(usbStatus{"connecting", "USB authorized. Connecting to the phone app…"})
+		if a.connectEndpoint(wired) {
+			a.setUSBStatus(usbStatus{"connected", "USB debugging authorized · PC connected"})
+			return
+		}
+		a.resetFailedUSB(info)
+	}
+	for _, candidate := range transportOrder(endpoint{}, a.discover(), known, manual) {
+		if a.connectEndpoint(candidate) {
+			return
+		}
+	}
+}
+
+func (a *App) resetFailedUSB(fallback usbStatus) {
+	// Forget the local ports if ADB restarted or the app was closed.
+	a.usb.close()
+	a.mu.Lock()
+	if a.device.USB.State != "different_phone" {
+		a.device.USB = fallback
+	}
+	a.mu.Unlock()
+}
+
+func (a *App) setUSBStatus(status usbStatus) {
+	a.mu.Lock()
+	a.device.USB = status
+	a.mu.Unlock()
 }
 
 func discoverPhone() string {
@@ -307,45 +404,114 @@ func discoverPhone() string {
 	}
 }
 
-func (a *App) connect(host string) {
-	if !a.connecting.CompareAndSwap(false, true) {
-		return
-	}
-	defer a.connecting.Store(false)
-	a.mu.RLock()
-	already := a.device.Connected
-	a.mu.RUnlock()
-	if already {
-		return
-	}
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(controlPort)), 2*time.Second)
+func (a *App) connectEndpoint(candidate endpoint) bool {
+	c, err := candidate.dial(candidate.control, 900*time.Millisecond)
 	if err != nil {
-		a.setError(err)
-		return
+		return false
 	}
+	adopted := false
+	defer func() {
+		if !adopted {
+			_ = c.Close()
+		}
+	}()
+	_ = c.SetDeadline(time.Now().Add(1500 * time.Millisecond))
+	reader := bufio.NewReader(c)
+	exchange := func(command string) (map[string]any, error) {
+		request, _ := json.Marshal(map[string]any{"id": command, "cmd": command, "payload": map[string]any{
+			"client": appName, "version": version, "transport": candidate.kind, "client_session": a.clientSession,
+		}})
+		if _, err := c.Write(append(request, '\n')); err != nil {
+			return nil, err
+		}
+		for {
+			line, err := reader.ReadSlice('\n')
+			if err != nil {
+				return nil, err
+			}
+			var result map[string]any
+			if json.Unmarshal(line, &result) == nil && result["id"] == command {
+				return result, nil
+			}
+		}
+	}
+	probe, err := exchange("probe")
+	if err != nil {
+		return false
+	}
+	id, _ := probe["device_id"].(string)
+	if candidate.kind == transportUSB && (probe["app"] != "TOD Astro Photography" || id == "") {
+		return false
+	}
+	a.mu.RLock()
+	expected := a.phoneID
+	explicit := candidate.kind == transportLAN && candidate.host == a.manualLAN &&
+		!a.sequence.Running && !a.video.Recording && !a.device.Connected
+	a.mu.RUnlock()
+	if expected != "" && id != expected && !explicit {
+		if candidate.kind == transportUSB {
+			a.setUSBStatus(usbStatus{"different_phone", "The USB phone differs from the phone bound to this session."})
+		}
+		return false
+	}
+	hello, err := exchange("hello")
+	if err != nil || hello["ok"] != true || hello["app"] != "TOD Astro Photography" {
+		return false
+	}
+	if id != "" && hello["device_id"] != id {
+		return false
+	}
+	if candidate.kind == transportUSB && id == "" {
+		return false
+	}
+	select {
+	case <-a.stop:
+		return false
+	default:
+	}
+	_ = c.SetDeadline(time.Time{})
 	a.connMu.Lock()
-	if a.control != nil {
-		a.connMu.Unlock()
-		_ = c.Close()
-		return
-	}
-	a.control = c
-	a.writer = bufio.NewWriter(c)
-	a.connMu.Unlock()
 	a.mu.Lock()
+	old := a.control
+	a.control, a.writer = c, bufio.NewWriter(c)
+	a.active = candidate
+	a.phoneID = id
 	a.device.Connected = true
-	a.device.Host = host
+	a.device.Host = candidate.host
+	a.device.Transport = candidate.kind
 	a.device.Status = "Connected"
 	a.device.LastError = ""
-	a.mu.Unlock()
-	go a.controlReadLoop(c)
-	go a.previewLoop(host, c)
-	if r, err := a.command("hello", map[string]any{"client": appName, "version": version}, 3*time.Second); err == nil {
-		a.applyHello(r)
-	} else {
-		a.setError(err)
+	a.device.Protocol, _ = asInt(hello["protocol"])
+	if recording, ok := hello["recording"].(bool); ok {
+		a.video.Recording = recording
+		if recording {
+			a.video.Message = "Recording"
+		} else if a.video.Message == "Recording" {
+			a.video.Message = "Idle"
+		}
 	}
+	a.notifyLinkLocked()
+	if candidate.kind == transportLAN {
+		a.knownLAN = candidate.host
+	}
+	a.mu.Unlock()
+	a.connMu.Unlock()
+	adopted = true
+	if old != nil {
+		_ = old.Close()
+	}
+	if candidate.kind == transportLAN {
+		saveLANPreference(a.lanPath, candidate.host)
+	}
+	go a.scanControl(c, reader)
+	go a.previewLoop(candidate, c)
 	a.queryCapabilities()
+	return true
+}
+
+func (a *App) notifyLinkLocked() {
+	close(a.linkChanged)
+	a.linkChanged = make(chan struct{})
 }
 
 func (a *App) queryCapabilities() {
@@ -363,42 +529,46 @@ func (a *App) queryCapabilities() {
 }
 
 func (a *App) disconnect(reason string) {
+	a.disconnectControl(nil, reason)
+}
+
+func (a *App) disconnectControl(expected net.Conn, reason string) {
 	a.connMu.Lock()
-	if a.control != nil {
-		_ = a.control.Close()
-		a.control = nil
-		a.writer = nil
+	if a.control == nil || (expected != nil && expected != a.control) {
+		a.connMu.Unlock()
+		return
 	}
-	a.connMu.Unlock()
+	old := a.control
+	a.control, a.writer = nil, nil
 	a.mu.Lock()
+	a.active = endpoint{}
 	a.device.Connected = false
-	a.device.Status = "Waiting for phone"
-	if a.device.Host != "" {
-		a.device.Status = "Reconnecting"
-	}
+	a.device.Transport = "Reconnecting"
+	a.device.Status = "Reconnecting"
 	a.device.Capabilities = map[string]any{}
 	a.device.Telemetry = map[string]any{}
 	a.latestFrame = nil
 	a.metrics = Metrics{}
 	a.lastFrameTime = time.Time{}
-	a.video.Recording = false
-	a.video.Message = "Idle"
 	if reason != "" {
 		a.device.LastError = reason
 	}
-	id := a.captureID
-	dir := a.session.CurrentDir
+	a.notifyLinkLocked()
 	a.mu.Unlock()
-	if reason != "" {
-		a.completeCapture(captureResult{id: id, err: fmt.Errorf("%s", reason)})
-		if id != "" {
-			appendSessionLog(dir, map[string]any{"event": "disconnected", "error": reason})
-		}
+	a.connMu.Unlock()
+	_ = old.Close()
+	select {
+	case a.reconnect <- struct{}{}:
+	default:
 	}
 }
 
 func (a *App) controlReadLoop(c net.Conn) {
-	scan := bufio.NewScanner(c)
+	a.scanControl(c, c)
+}
+
+func (a *App) scanControl(c net.Conn, r io.Reader) {
+	scan := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64*1024)
 	scan.Buffer(buf, 1024*1024)
 	for {
@@ -424,17 +594,15 @@ func (a *App) controlReadLoop(c net.Conn) {
 				continue
 			}
 		}
+		a.connMu.Lock()
+		current := a.control == c
+		a.connMu.Unlock()
+		if !current {
+			break
+		}
 		a.handleEvent(m)
 	}
-	a.disconnect("Phone link closed")
-}
-
-func (a *App) applyHello(r map[string]any) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if p, ok := asInt(r["protocol"]); ok {
-		a.device.Protocol = p
-	}
+	a.disconnectControl(c, "Phone connection lost")
 }
 
 func (a *App) handleEvent(m map[string]any) {
@@ -443,6 +611,10 @@ func (a *App) handleEvent(m map[string]any) {
 	case "telemetry":
 		a.mu.Lock()
 		a.device.Telemetry = m
+		if recording, ok := m["recording"].(bool); ok && recording {
+			a.video.Recording = true
+			a.video.Message = "Recording"
+		}
 		a.mu.Unlock()
 	case "video_progress":
 		a.mu.Lock()
@@ -453,7 +625,7 @@ func (a *App) handleEvent(m map[string]any) {
 		a.mu.Unlock()
 	case "video_review":
 		a.mu.Lock()
-		host := a.device.Host
+		target := a.active
 		path := fmt.Sprint(m["path"])
 		dir := a.videoSessions[path]
 		delete(a.videoSessions, path)
@@ -472,7 +644,7 @@ func (a *App) handleEvent(m map[string]any) {
 				if !ok {
 					continue
 				}
-				if _, err := a.fetchFile(host, fmt.Sprint(frame["path"]), filepath.Join(dir, "Best frames"), dir); err != nil {
+				if _, err := a.fetchAcrossLink(target, fmt.Sprint(frame["path"]), filepath.Join(dir, "Best frames"), dir); err != nil {
 					a.setError(err)
 				}
 			}
@@ -504,7 +676,14 @@ func (a *App) handleEvent(m map[string]any) {
 		files, _ := m["files"].([]any)
 		id, _ := m["capture_id"].(string)
 		a.mu.Lock()
-		host := a.device.Host
+		target := a.active
+		if id != "" {
+			if id != a.captureID || a.captureTransfers[id] {
+				a.mu.Unlock()
+				return
+			}
+			a.captureTransfers[id] = true
+		}
 		dir := a.ensureSessionDirLocked()
 		if m["kind"] == "video" && a.videoSession != "" {
 			dir = a.videoSession
@@ -533,7 +712,7 @@ func (a *App) handleEvent(m map[string]any) {
 				err = fmt.Errorf("phone saved no files")
 			}
 			for _, file := range files {
-				path, transferErr := a.fetchFile(host, fmt.Sprint(file), dir, sessionDir)
+				path, transferErr := a.fetchAcrossLink(target, fmt.Sprint(file), dir, sessionDir)
 				if transferErr != nil {
 					err = transferErr
 					break
@@ -548,6 +727,9 @@ func (a *App) handleEvent(m map[string]any) {
 			if err != nil {
 				a.setError(err)
 			}
+			a.mu.Lock()
+			delete(a.captureTransfers, id)
+			a.mu.Unlock()
 			a.completeCapture(captureResult{id: id, err: err})
 		}()
 
@@ -614,7 +796,7 @@ func (a *App) command(cmd string, payload map[string]any, timeout time.Duration)
 	}
 }
 
-func (a *App) previewLoop(host string, control net.Conn) {
+func (a *App) previewLoop(target endpoint, control net.Conn) {
 	for {
 		a.connMu.Lock()
 		active := a.control == control
@@ -622,7 +804,7 @@ func (a *App) previewLoop(host string, control net.Conn) {
 		if !active {
 			return
 		}
-		a.readPreview(host)
+		a.readPreview(target, control)
 		select {
 		case <-a.stop:
 			return
@@ -631,8 +813,8 @@ func (a *App) previewLoop(host string, control net.Conn) {
 	}
 }
 
-func (a *App) readPreview(host string) {
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(previewPort)), 2*time.Second)
+func (a *App) readPreview(target endpoint, control net.Conn) {
+	c, err := target.dial(target.preview, 2*time.Second)
 	if err != nil {
 		return
 	}
@@ -648,6 +830,12 @@ func (a *App) readPreview(host string) {
 		}
 		b := make([]byte, n)
 		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		a.connMu.Lock()
+		current := a.control == control
+		a.connMu.Unlock()
+		if !current {
 			return
 		}
 		a.ingestFrame(b)
@@ -763,8 +951,8 @@ func (a *App) analyzeFrame(b []byte) {
 	a.mu.Unlock()
 }
 
-func (a *App) fetchFile(host, path, dir, sessionDir string) (string, error) {
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(filePort)), 3*time.Second)
+func (a *App) fetchFile(target endpoint, path, dir, sessionDir string) (string, error) {
+	c, err := target.dial(target.file, 3*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -1059,29 +1247,16 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 			a.captureID = id
 			a.mu.Unlock()
 			payload := map[string]any{"raw": raw, "jpeg": jpeg, "target": target, "mode": mode, "frame_type": ft, "capture_id": id}
-			if _, err := a.command("capture", payload, 5*time.Second); err != nil {
+			if err := a.captureAcrossLinks(payload, cancel, dir); err != nil {
+				select {
+				case <-cancel:
+					return
+				default:
+				}
 				a.setError(err)
 				a.mu.Lock()
-				a.sequence.Message = "Capture error"
+				a.sequence.Message = "Capture failed"
 				a.mu.Unlock()
-				return
-			}
-			select {
-			case result := <-a.captureDone:
-				if result.err != nil {
-					a.setError(result.err)
-					a.mu.Lock()
-					a.sequence.Message = "Capture failed"
-					a.mu.Unlock()
-					return
-				}
-			case <-time.After(3 * time.Minute):
-				a.setError(fmt.Errorf("capture or transfer timed out"))
-				a.mu.Lock()
-				a.sequence.Message = "Capture timed out"
-				a.mu.Unlock()
-				return
-			case <-cancel:
 				return
 			}
 			a.mu.Lock()
@@ -1104,6 +1279,93 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 	}()
 	return nil
 }
+func (a *App) captureAcrossLinks(payload map[string]any, cancel <-chan struct{}, dir string) error {
+	deadline := time.NewTimer(3 * time.Minute)
+	defer deadline.Stop()
+	for {
+		if err := a.waitForSequenceLink(cancel, dir); err != nil {
+			return err
+		}
+		a.mu.RLock()
+		changed := a.linkChanged
+		a.mu.RUnlock()
+		if response, err := a.command("capture", payload, 5*time.Second); err != nil {
+			if response != nil {
+				return err
+			}
+			select {
+			case <-changed:
+				continue
+			case <-cancel:
+				return fmt.Errorf("sequence stopped")
+			case <-time.After(3 * time.Second):
+				return err
+			case <-deadline.C:
+				return fmt.Errorf("capture recovery timed out")
+			}
+		}
+		select {
+		case result := <-a.captureDone:
+			if result.err != nil {
+				select {
+				case <-changed:
+					continue
+				default:
+				}
+			}
+			return result.err
+		case <-changed:
+			// Retain the same capture ID so the phone can replay its receipt.
+			select {
+			case result := <-a.captureDone:
+				if result.err == nil {
+					return nil
+				}
+			default:
+			}
+		case <-deadline.C:
+			return fmt.Errorf("capture or transfer timed out")
+		case <-cancel:
+			return fmt.Errorf("sequence stopped")
+		}
+	}
+}
+
+func (a *App) fetchAcrossLink(first endpoint, path, dir, sessionDir string) (string, error) {
+	a.mu.RLock()
+	changed, current := a.linkChanged, a.active
+	a.mu.RUnlock()
+	if current.control != 0 {
+		first = current
+	}
+	local, err := a.fetchFile(first, path, dir, sessionDir)
+	if err == nil {
+		return local, nil
+	}
+	// Allow a file that was already being written to be requested on the new link.
+	timer := time.NewTimer(12 * time.Second)
+	defer timer.Stop()
+	for {
+		a.mu.RLock()
+		next, connected := a.active, a.device.Connected
+		a.mu.RUnlock()
+		if connected {
+			select {
+			case <-changed:
+				return a.fetchFile(next, path, dir, sessionDir)
+			default:
+			}
+		}
+		select {
+		case <-timer.C:
+			return "", err
+		case <-a.stop:
+			return "", err
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func (a *App) waitForSequenceLink(cancel <-chan struct{}, dir string) error {
 	a.mu.Lock()
 	if a.device.Connected {
@@ -1231,7 +1493,18 @@ func (a *App) routes() http.Handler {
 			writeErr(w, "invalid IP")
 			return
 		}
-		go a.connect(strings.TrimSpace(q.Host))
+		a.mu.Lock()
+		if a.sequence.Running || a.video.Recording {
+			a.mu.Unlock()
+			writeErr(w, "Finish the active capture before pairing another phone.")
+			return
+		}
+		a.manualLAN = strings.TrimSpace(q.Host)
+		a.mu.Unlock()
+		select {
+		case a.reconnect <- struct{}{}:
+		default:
+		}
 		writeJSON(w, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("/api/controls", func(w http.ResponseWriter, r *http.Request) {
@@ -1491,6 +1764,10 @@ func main() {
 	a.stopSequence()
 	a.disconnect("")
 	_ = srv.Close()
+	select {
+	case <-a.discoveryDone:
+	case <-time.After(6 * time.Second):
+	}
 }
 
 func init() {

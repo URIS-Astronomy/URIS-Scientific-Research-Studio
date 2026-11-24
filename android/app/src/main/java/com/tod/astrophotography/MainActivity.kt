@@ -83,6 +83,10 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         findViewById<Button>(R.id.captureButton).setOnClickListener { showCaptureOptions() }
         findViewById<Button>(R.id.capturePreset).setOnClickListener { showCapturePresets() }
 
+        val preferences = getSharedPreferences("connection", MODE_PRIVATE)
+        val deviceId = preferences.getString("device_id", null) ?: java.util.UUID.randomUUID().toString().also {
+            preferences.edit().putString("device_id", it).apply()
+        }
         astroServer = AstroServer(object : AstroServer.CommandHandler {
             override fun capabilities(): JSONObject = cameraController?.capabilities()
                 ?: JSONObject().put("ok", false).put("error", "Camera not ready")
@@ -103,6 +107,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
             override fun telemetry(): JSONObject = buildTelemetry()
 
+            override fun isRecording(): Boolean = cameraController?.isRecording() == true
+
             override fun resolveCapturedFile(path: String): File? {
                 if (path.isBlank()) return null
                 return try {
@@ -112,10 +118,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                     if (requested.isFile && requested.path.startsWith(captureRoot.path + File.separator)) requested else null
                 } catch (_: Exception) { null }
             }
-        }) { connected ->
+        }, deviceId) { transport ->
             runOnUiThread {
-                connection.text = if (connected) "PC CONNECTED" else "PC OFFLINE"
-                connection.setTextColor(getColor(if (connected) R.color.green else R.color.amber))
+                connection.text = when (transport) {
+                    "USB" -> "USB DEBUGGING AUTHORIZED · PC CONNECTED"
+                    "LAN" -> "LAN · PC CONNECTED"
+                    else -> "PC OFFLINE"
+                }
+                connection.setTextColor(getColor(if (transport != null) R.color.green else R.color.amber))
             }
         }.also { it.start() }
 
@@ -308,8 +318,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val base = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: filesDir
         val stat = StatFs(base.absolutePath)
         val freeGb = stat.availableBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
+        val plugged = registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+            ?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
         return JSONObject()
             .put("ok", true)
+            .put("recording", cameraController?.isRecording() == true)
+            .put("usb_power", (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0)
             .put("preview_frames", cameraController?.previewFrames?.get() ?: 0)
             .put("battery_percent", battery)
             .put("charging", charging)
