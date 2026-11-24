@@ -4,4 +4,6 @@ The Android workflow compiles and lints the APK. Android JVM tests exercise enco
 
 Go tests cover capture correlation, reconnect between exposures, interrupted journal recovery, synthetic stellar HFR/FWHM, dark/flat correction, and uncompressed Bayer DNG decoding. The local dashboard smoke test uses a mock phone and exercises discovery, preview, video mode selection, still sequence delivery, and live-stack PNG export.
 
-Hardware qualification still requires the Vivo T3 Ultra and a Windows PC for the live capture, high-speed recording, focus, DNG and thermal soak. The Android APK is debug-signed and the Windows executable is unsigned. The optional Siril CLI integration needs an end-to-end test with a supported installation.
+Hardware qualification still requires the Vivo T3 Ultra and a Windows PC for the live capture, high-speed recording, focus, DNG and thermal soak. The Android APK is debug-signed and the Windows executable is unsigned. Siril CLI 1.4.5 ran the generated script against synthetic JPEG bias, dark, flat and shifted light frames. It produced a registered 32-bit RGB FITS stack. The Windows launcher and physical Vivo RAW data require final runtime checks.
+
+A mock-phone restart test resumed the original session after terminating the PC process. A second test terminated the PC with a capture in flight and verified the resumed process replayed the same capture ID, preserved the other exposures, and produced one file for each requested exposure.

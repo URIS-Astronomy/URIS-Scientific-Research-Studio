@@ -10,6 +10,7 @@ import (
 )
 
 type SessionRecord struct {
+	Paths        []string          `json:"-"`
 	PendingID    string            `json:"-"`
 	PendingIndex int               `json:"-"`
 	ID           string            `json:"id"`
@@ -28,10 +29,12 @@ func readSession(path, id string) SessionRecord {
 		return out
 	}
 	defer f.Close()
+	seen := map[string]bool{}
 	scan := bufio.NewScanner(f)
 	scan.Buffer(make([]byte, 4096), 2<<20)
 	for scan.Scan() {
 		var event struct {
+			Path          string            `json:"path"`
 			CaptureID     string            `json:"capture_id"`
 			ExposureIndex int               `json:"exposure_index"`
 			Kind          string            `json:"event"`
@@ -66,7 +69,16 @@ func readSession(path, id string) SessionRecord {
 				out.PendingID = ""
 			}
 		case "file_received":
-			out.Files++
+			if !seen[event.Path] {
+				seen[event.Path] = true
+				out.Files++
+				relative, err := filepath.Rel(filepath.Dir(path), event.Path)
+				if err == nil && filepath.IsLocal(relative) {
+					if info, err := os.Stat(event.Path); err == nil && info.Mode().IsRegular() {
+						out.Paths = append(out.Paths, event.Path)
+					}
+				}
+			}
 		}
 	}
 	if out.State.Running || (out.State.Requested > out.State.Completed && out.State.Message != "Stopped") {

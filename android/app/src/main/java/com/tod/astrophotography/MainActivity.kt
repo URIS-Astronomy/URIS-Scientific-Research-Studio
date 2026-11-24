@@ -16,6 +16,8 @@ import android.os.StatFs
 import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -79,6 +81,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
         findViewById<Button>(R.id.cameraControls).setOnClickListener { showCameraControls() }
         findViewById<Button>(R.id.captureButton).setOnClickListener { showCaptureOptions() }
+        findViewById<Button>(R.id.capturePreset).setOnClickListener { showCapturePresets() }
 
         astroServer = AstroServer(object : AstroServer.CommandHandler {
             override fun capabilities(): JSONObject = cameraController?.capabilities()
@@ -142,6 +145,39 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         ).also { it.start() }
     }
 
+    private data class CapturePreset(val name: String, val iso: Int?, val exposureUs: Long?, val crop: Int)
+    private fun showCapturePresets() {
+        val camera = cameraController
+        val caps = camera?.capabilities()
+        if (camera == null || caps?.optBoolean("ok") != true) {
+            status.text = "Camera unavailable. Open Camera controls to check readiness."
+            return
+        }
+        val presets = listOf(
+            CapturePreset("General Manual", null, null, 100),
+            CapturePreset("Planetary", 200, 5000, 50),
+            CapturePreset("Moon", 100, 2000, 100),
+            CapturePreset("Solar", 50, 1000, 100),
+            CapturePreset("Deep Sky", 800, 1000000, 100),
+            CapturePreset("EAA / Live Stack", 800, 500000, 100)
+        )
+        val manual = caps.optBoolean("manual_sensor")
+        AlertDialog.Builder(this).setTitle("Capture preset")
+            .setItems(presets.map { it.name }.toTypedArray()) { _, index ->
+                val preset = presets[index]
+                val settings = JSONObject().put("roi_percent", preset.crop)
+                if (manual && preset.iso != null && preset.exposureUs != null) {
+                    settings.put("manual", true).put("iso", preset.iso).put("exposure_us", preset.exposureUs)
+                }
+                val suffix = when {
+                    !manual -> " • Auto exposure"
+                    preset.name == "EAA / Live Stack" -> " • Start stacking in TOD Astro Suite"
+                    else -> ""
+                }
+                showCommandResult(camera.setControls(settings), preset.name + suffix)
+            }.setNegativeButton("Cancel", null).show()
+    }
+
     private fun showCameraControls() {
         val camera = cameraController
         val caps = camera?.capabilities()
@@ -183,6 +219,20 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         toggle("AE lock", "ae_lock", caps.optBoolean("ae_lock_supported"))
         toggle("AWB lock", "awb_lock", caps.optBoolean("awb_lock_supported"))
         number("Centered crop (%)", "roi_percent", caps.optDouble("max_zoom") > 1)
+        val whiteBalance = caps.optJSONArray("awb_modes")
+        val awbLabels = listOf("Off", "Auto", "Incandescent", "Fluorescent", "Warm fluorescent", "Daylight", "Cloudy daylight", "Twilight", "Shade")
+        val modes = (0 until (whiteBalance?.length() ?: 0)).mapNotNull { i ->
+            whiteBalance?.optInt(i)?.takeIf { it in 1 until awbLabels.size }
+        }
+        if (modes.size > 1) {
+            form.addView(TextView(this).apply { text = "White balance" })
+            val chooser = Spinner(this).apply {
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, modes.map { awbLabels[it] })
+                setSelection(modes.indexOf(controls.optInt("awb_mode")).coerceAtLeast(0))
+            }
+            form.addView(chooser)
+            bind.add { if (chooser.selectedItemPosition in modes.indices) payload.put("awb_mode", modes[chooser.selectedItemPosition]) }
+        }
         AlertDialog.Builder(this).setTitle("Camera controls")
             .setView(ScrollView(this).apply { addView(form) })
             .setNeutralButton("Camera report") { _, _ ->

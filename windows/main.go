@@ -947,6 +947,7 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord) error {
 	if resume != nil {
 		dir, _ = sessionPath(a.session.Root, resume.ID)
 		a.session.CurrentDir, a.sessionID = dir, filepath.Base(dir)
+		a.session.CapturedFiles = append([]string(nil), resume.Paths...)
 		controls = cloneMap(resume.Controls)
 		completed = resume.State.Completed
 	}
