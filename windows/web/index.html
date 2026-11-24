@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TOD Astro Suite</title>
+<link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand"><img src="/assets/icon.png"/><div><div class="brand-title"><span>TOD</span> Astro Suite</div><div class="brand-sub">1.0 Engineering RC</div></div></div>
+    <nav id="nav">
+      <button class="nav active" data-mode="Capture"><span>◉</span><b>Capture</b></button>
+      <button class="nav" data-mode="Planetary"><span>◌</span><b>Planetary</b></button>
+      <button class="nav" data-mode="Lunar / Solar"><span>☾</span><b>Lunar / Solar</b></button>
+      <button class="nav" data-mode="Deep Sky"><span>✦</span><b>Deep Sky</b></button>
+      <button class="nav" data-mode="Live Stack"><span>▣</span><b>Live Stack / EAA</b></button>
+      <button class="nav" data-mode="Focus"><span>⌖</span><b>Focus Assistant</b></button>
+      <button class="nav" data-mode="Sessions"><span>≡</span><b>Sessions</b></button>
+    </nav>
+    <div class="side-bottom">
+      <div class="device-mini"><div class="dot offline" id="sideDot"></div><div><b id="sideStatus">PHONE OFFLINE</b><small id="sideHost">Auto discovery active</small></div></div>
+      <button class="ghost full" id="reconnectBtn">Reconnect phone</button>
+    </div>
+  </aside>
+  <main>
+    <header class="topbar">
+      <div><h1 id="pageTitle">Capture</h1><p id="pageHint">Live telescope feed and camera control</p></div>
+      <div class="top-actions">
+        <div class="target-box"><span>Target</span><input id="targetInput" value="Jupiter"/></div>
+        <div class="status-pill offline" id="statusPill"><span class="dot"></span><b id="statusText">PHONE OFFLINE</b></div>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <div class="stage-panel">
+        <div class="stage-toolbar">
+          <div class="toolgroup"><button class="tool active" data-overlay="crosshair">Crosshair</button><button class="tool" data-overlay="clip">Clipping</button><button class="tool" data-overlay="peaking">Focus peaking</button></div>
+          <div class="toolgroup"><button class="tool" id="fitBtn">Fit</button><button class="tool" id="oneBtn">1:1</button><button class="tool" id="redBtn">Night red</button></div>
+        </div>
+        <div class="viewer" id="viewer">
+          <img id="preview" alt="Live telescope feed"/>
+          <div id="offlineState" class="offline-state"><div class="scope-icon">◉</div><h2>Waiting for TOD Astro Photography</h2><p>Open the phone app on your Vivo T3 Ultra. The live telescope feed will appear automatically.</p><div class="manual-connect"><input id="manualIp" placeholder="Phone IP (optional)"/><button id="manualConnectBtn">Connect</button></div></div>
+          <div class="crosshair" id="crosshair"><i></i><i></i><span></span></div>
+          <canvas class="analysis-overlay" id="analysisOverlay"></canvas><div class="clip-overlay" id="clipOverlay"></div>
+          <div class="viewer-badges"><span id="resBadge">—</span><span id="fpsBadge">0.0 FPS</span><span id="bitrateBadge">0.0 Mb/s</span></div>
+        </div>
+        <div class="analysis-strip">
+          <div class="metric"><span>Focus score</span><strong id="focusMetric">0.0</strong><em id="focusTrend">Waiting</em></div>
+          <div class="metric"><span>Mean</span><strong id="meanMetric">0</strong><em>0–255</em></div>
+          <div class="metric"><span>Shadow clip</span><strong id="shadowMetric">0.00%</strong><em>≤ 2</em></div>
+          <div class="metric"><span>Highlight clip</span><strong id="highlightMetric">0.00%</strong><em>≥ 253</em></div>
+          <div class="hist-wrap"><canvas id="histogram" width="480" height="88"></canvas></div>
+        </div>
+      </div>
+
+      <aside class="inspector">
+        <div class="tabs"><button class="tab active" data-tab="camera">Camera</button><button class="tab" data-tab="run">Capture run</button><button class="tab" data-tab="analysis">Analysis</button></div>
+        <div id="cameraTab" class="tab-body active">
+          <div class="section-title">Exposure</div>
+          <label class="field"><span>Manual sensor</span><input id="manualToggle" type="checkbox" checked /></label>
+          <label class="field"><span>ISO <small id="isoRange">capability aware</small></span><input id="iso" type="number" value="200" /></label>
+          <label class="field"><span>Exposure <small>µs</small></span><input id="exposure" type="number" value="10000" /></label>
+          <label class="field"><span>Focus distance <small>diopters</small></span><input id="focus" type="number" step="0.01" value="0" /></label>
+          <button class="primary full" id="applyBtn">Apply camera controls</button>
+          <div class="section-title">Camera capabilities</div>
+          <div class="cap-grid" id="capGrid">
+            <div><span>RAW</span><b>Unknown</b></div><div><span>Manual</span><b>Unknown</b></div><div><span>High speed</span><b>Unknown</b></div><div><span>Burst</span><b>Unknown</b></div>
+          </div>
+          <details><summary>Camera report</summary><pre id="cameraDetails"></pre></details>
+          <div class="section-title">Stabilization / color</div>
+          <label class="field" hidden><span>White balance</span><select id="awbMode"></select></label>
+          <label class="field"><span>AE lock</span><input id="aeLock" type="checkbox" /></label>
+          <label class="field"><span>AWB lock</span><input id="awbLock" type="checkbox" /></label>
+          <label class="field"><span>OIS</span><select id="ois"><option value="off">Off</option><option value="on">On</option></select></label>
+          <label class="field"><span>EIS</span><select id="eis"><option value="off">Off</option><option value="on">On</option></select></label>
+        </div>
+
+        <div id="runTab" class="tab-body">
+          <div class="section-title">Target profile</div>
+          <label class="field"><span>Profile</span><select id="profile"><option>Jupiter</option><option>Saturn</option><option>Mars</option><option>Venus</option><option>Moon</option><option>Sun</option><option>Deep Sky</option><option>Custom</option></select></label>
+          <label class="field"><span>Frame type</span><select id="frameType"><option>Light</option><option>Dark</option><option>Flat</option><option>Bias</option></select></label>
+          <label class="field"><span>Format</span><select id="format"><option value="jpeg">JPEG</option><option value="raw+jpeg">RAW + JPEG</option><option value="raw">RAW / DNG</option></select></label>
+          <label class="field"><span>Frame count</span><input id="count" type="number" min="1" value="100" /></label>
+          <label class="field"><span>Interval <small>ms</small></span><input id="interval" type="number" min="0" value="0" /></label>
+          <div class="run-buttons"><button class="capture" id="singleBtn">Single capture</button><button class="primary" id="startSeqBtn">Start sequence</button></div>
+          <button class="danger full" id="stopSeqBtn">Stop sequence</button>
+          <div class="progress-card"><div class="progress-head"><b id="seqStatus">Idle</b><span id="seqCount">0 / 0</span></div><div class="progress"><i id="seqBar"></i></div></div>
+          <div id="integration" role="status"></div>
+          <div id="stackTools" hidden>
+            <label class="field"><span>Show stack</span><input id="showStack" type="checkbox" checked /></label>
+            <output id="stackStats"></output>
+            <a id="saveStack" href="/api/stack.png?download" hidden>Save stack PNG</a>
+          </div>
+          <div class="section-title">Planetary video</div>
+          <label class="field"><span>Resolution / FPS</span><select id="fpsMode" disabled><option>Connect phone to query modes</option></select></label>
+          <label class="field"><span>ROI</span><select id="roi"><option>Full frame</option><option>75%</option><option>50%</option><option>25%</option></select></label>
+          <label class="field"><span>Capture duration <small>s</small></span><input id="duration" type="number" value="60" /></label>
+          <div class="run-buttons"><button class="primary" id="startVideoBtn">Start video</button><button class="danger" id="stopVideoBtn">Stop video</button></div>
+          <div class="hint" id="videoState" role="status">Idle</div>
+          <div class="hint" id="highSpeedNote" hidden>High-speed recording uses automatic exposure and phone-only preview. PC live view resumes when recording stops.</div>
+        </div>
+
+        <div id="analysisTab" class="tab-body">
+          <div class="section-title">Histogram</div>
+          <label class="field"><span>False-color clipping</span><input id="clipToggle" type="checkbox" /></label>
+          <label class="field"><span>Display stretch <small>preview only</small></span><input id="stretch" type="range" min="0" max="100" value="0" /></label>
+          <div class="section-title">Quality</div>
+          <div class="quality-card"><span>Current focus</span><strong id="focusBig">0.0</strong><small>Higher is sharper. Use only as a relative metric for the same target/scale.</small></div>
+          <div class="section-title">Processing backend</div>
+          <div class="backend"><span>Siril CLI</span><b id="sirilStatus">Not detected</b></div><div class="backend"><span>Captured files</span><b id="fileCount">0</b></div>
+          <button class="ghost full" id="sirilBtn">Process current session in Siril</button>
+        </div>
+      </aside>
+    </section>
+
+    <footer class="statusbar">
+      <div><span class="dot offline" id="footerDot"></span><b id="footerStatus">Waiting for phone</b><span id="footerDetail">Auto-discovery runs in the background.</span></div>
+      <div class="telemetry"><span id="battery">Battery —</span><span id="temp">Temp —</span><span id="storage">Phone storage —</span><span id="pcFolder">Session folder ready</span></div>
+    </footer>
+  </main>
+</div>
+<script src="/assets/app.js"></script>
+</body>
+</html>

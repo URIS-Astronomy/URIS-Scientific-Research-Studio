@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:background="@color/bg" android:padding="14dp">
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:gravity="center_vertical" android:paddingBottom="10dp">
+        <ImageView android:layout_width="42dp" android:layout_height="42dp" android:src="@drawable/tod_icon" android:contentDescription="TOD" />
+        <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:paddingLeft="10dp">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="TOD Astro Photography" android:textColor="@color/text" android:textStyle="bold" android:textSize="19sp" />
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Vivo telescope capture engine" android:textColor="@color/muted" android:textSize="11sp" />
+        </LinearLayout>
+        <TextView android:id="@+id/connection" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/pill" android:text="PC OFFLINE" android:textColor="@color/amber" android:textStyle="bold" android:textSize="10sp" />
+    </LinearLayout>
+
+    <FrameLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1" android:background="@drawable/panel" android:padding="4dp">
+        <TextureView android:id="@+id/preview" android:layout_width="match_parent" android:layout_height="match_parent" />
+        <View android:layout_width="1dp" android:layout_height="match_parent" android:layout_gravity="center_horizontal" android:background="#55FFFFFF" android:layout_marginTop="38dp" android:layout_marginBottom="38dp" />
+        <View android:layout_width="match_parent" android:layout_height="1dp" android:layout_gravity="center_vertical" android:background="#55FFFFFF" android:layout_marginLeft="38dp" android:layout_marginRight="38dp" />
+        <TextView android:id="@+id/cameraBadge" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_gravity="left|bottom" android:layout_margin="8dp" android:background="@drawable/pill" android:text="Camera starting…" android:textColor="@color/text" android:textSize="10sp" />
+    </FrameLayout>
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:paddingTop="10dp">
+        <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical" android:background="@drawable/panel" android:padding="10dp">
+            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="SESSION" android:textColor="@color/muted" android:textSize="9sp" android:textStyle="bold" />
+            <TextView android:id="@+id/status" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Preparing camera…" android:textColor="@color/text" android:textSize="12sp" android:paddingTop="4dp" />
+            <TextView android:id="@+id/telemetry" android:layout_width="match_parent" android:layout_height="wrap_content" android:text="Battery — • Temp — • Storage —" android:textColor="@color/muted" android:textSize="10sp" android:paddingTop="5dp" />
+        </LinearLayout>
+        <Button android:id="@+id/exitButton" android:layout_width="104dp" android:layout_height="match_parent" android:layout_marginLeft="9dp" android:background="@drawable/exit_button" android:text="EXIT" android:textColor="#FFBCC1" android:textStyle="bold" />
+    </LinearLayout>
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:paddingTop="6dp">
+        <Button android:id="@+id/cameraControls" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Camera controls" />
+        <Button android:id="@+id/captureButton" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="Capture" />
+    </LinearLayout>
+</LinearLayout>

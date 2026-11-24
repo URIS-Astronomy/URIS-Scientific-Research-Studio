@@ -1,0 +1,65 @@
+name: Build TOD Astro Suite
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-35' 'build-tools;34.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build, test, and lint
+        working-directory: android
+        run: gradle --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+      - name: Stage Engineering RC APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk TOD_Astro_Photography.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TOD-Astro-Photography-APK
+          path: TOD_Astro_Photography.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test and analyze
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check web/app.js
+      - name: Build Windows GUI
+        run: go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../TOD_Astro_Suite.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TOD-Astro-Suite-Windows
+          path: TOD_Astro_Suite.exe
+          if-no-files-found: error
