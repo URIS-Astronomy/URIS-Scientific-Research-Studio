@@ -688,7 +688,7 @@ func (a *App) analyzeFrame(b []byte) {
 	for i := 253; i < 256; i++ {
 		high += hist[i]
 	}
-	m := Metrics{Histogram: hist, Frames: a.frameCounter}
+	m := Metrics{Histogram: hist}
 	if total > 0 {
 		m.Mean = float64(sum) / float64(total)
 		m.Median = median
@@ -699,6 +699,7 @@ func (a *App) analyzeFrame(b []byte) {
 		m.FocusScore = focus / float64(focusN)
 	}
 	a.mu.Lock()
+	m.Frames = a.frameCounter
 	m.FPS = a.metrics.FPS
 	m.BitrateMbps = a.metrics.FPS * float64(len(b)) * 8 / 1e6
 	m.Dropped = a.metrics.Dropped
@@ -892,6 +893,15 @@ func (a *App) startSequence(req map[string]any) error {
 				return
 			default:
 			}
+			if err := a.waitForSequenceLink(cancel, dir); err != nil {
+				a.mu.Lock()
+				if a.sequence.Message != "Stopped" {
+					a.sequence.Message = "Reconnect timed out"
+					a.device.LastError = err.Error()
+				}
+				a.mu.Unlock()
+				return
+			}
 			id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)
 			a.mu.Lock()
 			select {
@@ -927,6 +937,7 @@ func (a *App) startSequence(req map[string]any) error {
 				return
 			}
 			a.mu.Lock()
+			a.captureID = ""
 			a.sequence.Completed = i + 1
 			if ft == "Light" {
 				a.sequence.IntegrationUS += int64(exposure)
@@ -945,6 +956,45 @@ func (a *App) startSequence(req map[string]any) error {
 	}()
 	return nil
 }
+func (a *App) waitForSequenceLink(cancel <-chan struct{}, dir string) error {
+	a.mu.Lock()
+	if a.device.Connected {
+		a.mu.Unlock()
+		return nil
+	}
+	if a.sequence.Message == "Stopped" {
+		a.mu.Unlock()
+		return fmt.Errorf("sequence stopped")
+	}
+	a.sequence.Message = "Waiting for phone"
+	a.mu.Unlock()
+
+	appendSessionLog(dir, map[string]any{"event": "waiting_for_phone"})
+	deadline := time.NewTimer(2 * time.Minute)
+	defer deadline.Stop()
+	retry := time.NewTicker(250 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		select {
+		case <-cancel:
+			return fmt.Errorf("sequence stopped")
+		case <-deadline.C:
+			return fmt.Errorf("phone did not reconnect within two minutes")
+		case <-retry.C:
+			a.mu.Lock()
+			connected := a.device.Connected
+			if connected && a.sequence.Message == "Waiting for phone" {
+				a.sequence.Message = "Capturing"
+			}
+			a.mu.Unlock()
+			if connected {
+				appendSessionLog(dir, map[string]any{"event": "reconnected"})
+				return nil
+			}
+		}
+	}
+}
+
 func (a *App) stopSequence() {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -18,6 +18,7 @@ func TestSequenceCountsOnlyMatchingSuccessfulCapture(t *testing.T) {
 	suite, phone := net.Pipe()
 	defer suite.Close()
 	defer phone.Close()
+	a.device.Connected = true
 	a.control = suite
 	a.writer = bufio.NewWriter(suite)
 	go a.controlReadLoop(suite)
@@ -76,5 +77,49 @@ func TestEmbeddedDashboardServesCaptureControls(t *testing.T) {
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), content) {
 			t.Errorf("%s returned HTTP %d without %q", path, response.Code, content)
 		}
+	}
+}
+
+func TestSequenceWaitsForReconnectBetweenExposures(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	a := newApp()
+	a.sequence.Message = "Capturing"
+	cancel := make(chan struct{})
+	defer close(cancel)
+	dir := t.TempDir()
+
+	result := make(chan error, 1)
+	go func() { result <- a.waitForSequenceLink(cancel, dir) }()
+	deadline := time.Now().Add(2 * time.Second)
+	waiting := false
+	for time.Now().Before(deadline) {
+		if a.snapshot().Sequence.Message == "Waiting for phone" {
+			waiting = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("sequence did not enter the reconnect state")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("wait returned before reconnect: %v", err)
+	default:
+	}
+	a.mu.Lock()
+	a.device.Connected = true
+	a.mu.Unlock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not return after reconnect")
+	}
+	if got := a.snapshot().Sequence.Message; got != "Capturing" {
+		t.Fatalf("expected Capturing after reconnect, got %s", got)
 	}
 }

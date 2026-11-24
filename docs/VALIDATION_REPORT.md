@@ -5,3 +5,5 @@ GitHub Actions runs an Android Gradle build and lint job and a native Windows co
 Go regression coverage exercises the embedded dashboard entry points and verifies that a still sequence counts only matching successful captures. The Android Gradle unit-test task has no test sources. Camera2 stream combinations, installation and capture on a physical Vivo T3 Ultra, native Windows UI interaction, and Siril processing require runtime verification.
 
 Local validation also exercised the dashboard in Chromium using a mock phone. It covered automatic discovery, the live preview, stable video-mode selection, receipt of a three-frame sequence, and live-stack PNG export.
+
+A separate mock-phone test disconnected the control and preview sockets after the first exposure in a four-frame sequence. After discovery reconnected, live view returned and the remaining exposures completed.
