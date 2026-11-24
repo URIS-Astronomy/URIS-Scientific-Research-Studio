@@ -15,7 +15,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: 45437731374
+          run-id: 45439959313
           name: TOD-Astro-Photography-APK
           path: apk
       - name: Enable KVM on the runner
@@ -89,9 +89,9 @@ jobs:
                       data = self.events.popleft() if self.events else self.next()
                       if data.get(field) != value:
                           continue
-                      assert data.get("event") != "capture_error", data
                       if data.get("event") == name:
                           return data
+                      assert data.get("event") != "capture_error", data
                   raise AssertionError(f"event {name} for {value} not received")
           
           
@@ -299,6 +299,23 @@ jobs:
                   control.call("set_controls", {"manual": False})
               else:
                   print("Emulator camera did not advertise a one-second manual exposure", flush=True)
+                  if ready_caps.get("burst_capture"):
+                      cancelled = "emulator-burst-cancel"
+                      control.call("capture", {"capture_id": cancelled, "jpeg": True, "burst_count": 16})
+                      control.call("cancel_capture", {"capture_id": cancelled})
+                      cancelled_event = control.event("capture_error", "capture_id", cancelled)
+                      assert cancelled_event["message"] == "Capture cancelled", cancelled_event
+                      for _ in range(30):
+                          ready_caps = control.call("capabilities", allow_error=True)
+                          if ready_caps.get("ok"):
+                              break
+                          time.sleep(.25)
+                      assert ready_caps.get("ok"), ready_caps
+                      restarted = "emulator-burst-restart"
+                      control.call("capture", {"capture_id": restarted, "jpeg": True})
+                      restarted_event = control.event("capture_saved", "capture_id", restarted)
+                      assert len(restarted_event["files"]) == 1, restarted_event
+                      print("Native emulator cancelled an active JPEG burst and saved a subsequent still", flush=True)
           
               choose_exit_button("CANCEL")
               control.call("ping")
