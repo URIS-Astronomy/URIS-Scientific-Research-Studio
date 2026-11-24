@@ -85,6 +85,9 @@ class CameraController(
     private var roiPercent = 100
 
     private val lastPreviewNs = AtomicLong(0L)
+    @Volatile var previewHistogram = IntArray(0)
+        private set
+    val previewFrames = AtomicLong(0L)
     private val previewIntervalNs = 80_000_000L // ~12.5 fps max before USB/network limits
 
     private val captureLock = Any()
@@ -407,7 +410,7 @@ class CameraController(
         var lastReport = 0L
         val counters = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
-                if (!recording || mediaRecorder !== recorder || !request.targets.contains(encoderSurface)) return
+                if (!recording || mediaRecorder !== recorder) return
                 videoFrames++
                 if (timestamp - lastReport >= 1_000_000_000L) {
                     lastReport = timestamp
@@ -617,6 +620,7 @@ class CameraController(
                     val now = System.nanoTime()
                     val previous = lastPreviewNs.get()
                     if (now - previous >= previewIntervalNs && lastPreviewNs.compareAndSet(previous, now)) {
+                        if (previewFrames.incrementAndGet() % 4L == 1L) previewHistogram = sampleHistogram(image)
                         frameSink(yuvToJpeg(image, 82))
                     }
                 } catch (_: Exception) {
@@ -857,6 +861,16 @@ class CameraController(
         }
         eventSink(JSONObject().put("event", "capture_error").put("message", message)
             .put("capture_id", pending?.captureId ?: ""))
+    }
+
+    private fun sampleHistogram(image: Image): IntArray {
+        val plane = image.planes[0]
+        val bins = IntArray(64)
+        for (y in 0 until image.height step 8) for (x in 0 until image.width step 8) {
+            val i = y * plane.rowStride + x * plane.pixelStride
+            if (i < plane.buffer.limit()) bins[(plane.buffer.get(i).toInt() and 255) / 4]++
+        }
+        return bins
     }
 
     private fun yuvToJpeg(image: Image, quality: Int): ByteArray {

@@ -160,10 +160,12 @@ async function loadSessions() {
 function renderSessionSelection() {
   const record = savedSessions.find(s => s.id === $('savedSessions').value);
   const run = record?.state;
+  $('openSavedSession').disabled = !record;
   $('savedSessionInfo').textContent = run ? `${run.message || 'Saved'} · ${run.completed} / ${run.requested} exposures · ${record.files} files` : 'No saved sessions';
   $('resumeSession').disabled = !run || run.completed >= run.requested || !state?.device.connected || state.sequence.running;
   $('resumeSession').title = $('resumeSession').disabled ? 'Select an unfinished session with the phone connected and capture idle' : '';
 }
+$('openSavedSession').onclick = () => api('/api/open-folder',{id:$('savedSessions').value}).catch(e => alert(e.message));
 $('savedSessions').onchange = renderSessionSelection;
 $('refreshSessions').onclick = () => loadSessions().catch(e => alert(e.message));
 $('resumeSession').onclick = async () => {

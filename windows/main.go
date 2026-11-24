@@ -850,7 +850,7 @@ func appendSessionLog(dir string, m map[string]any) {
 	}
 	defer f.Close()
 	b, _ := json.Marshal(m)
-	_, _ = f.Write(append(b, '\n'))
+	_, _ = f.Write(append(append([]byte{'\n'}, b...), '\n'))
 }
 
 func asInt(v any) (int, bool) {
@@ -1336,11 +1336,32 @@ func (a *App) routes() http.Handler {
 		a.mu.Unlock()
 		writeJSON(w, map[string]any{"ok": true})
 	})
-	mux.HandleFunc("/api/open-folder", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/open-folder", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID string `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
 		a.mu.RLock()
-		dir := a.session.CurrentDir
+		dir, root := a.session.CurrentDir, a.session.Root
 		a.mu.RUnlock()
-		_ = exec.Command("explorer.exe", dir).Start()
+		if request.ID != "" {
+			var ok bool
+			dir, ok = sessionPath(root, request.ID)
+			if !ok {
+				writeErr(w, "Invalid session")
+				return
+			}
+		}
+		if stat, err := os.Stat(dir); err != nil || !stat.IsDir() {
+			writeErr(w, "Session folder is unavailable")
+			return
+		}
+		cmd := exec.Command("explorer.exe", dir)
+		if err := cmd.Start(); err != nil {
+			writeErr(w, err.Error())
+			return
+		}
+		go func() { _ = cmd.Wait() }()
 		writeJSON(w, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("POST /api/siril", func(w http.ResponseWriter, r *http.Request) {

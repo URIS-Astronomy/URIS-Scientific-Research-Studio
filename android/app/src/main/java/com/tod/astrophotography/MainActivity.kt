@@ -35,6 +35,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var connection: TextView
     private lateinit var telemetry: TextView
     private lateinit var cameraBadge: TextView
+    private lateinit var histogram: HistogramView
+    private lateinit var previewFramesLabel: TextView
     @Volatile private var cameraController: CameraController? = null
     @Volatile private var astroServer: AstroServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -45,6 +47,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         override fun run() {
             if (exiting) return
             val t = buildTelemetry()
+            val camera = cameraController
+            histogram.update(camera?.previewHistogram ?: IntArray(0))
+            previewFramesLabel.text = "Preview frames ${camera?.previewFrames?.get() ?: 0}"
             telemetry.text = "Battery ${t.optInt("battery_percent", 0)}%${if (t.optBoolean("charging")) " ⚡" else ""} • Temp ${"%.1f".format(t.optDouble("temperature_c", 0.0))}°C • Free ${"%.1f".format(t.optDouble("free_storage_gb", 0.0))} GB"
             astroServer?.sendEvent(JSONObject(t.toString()).put("event", "telemetry"))
             ui.postDelayed(this, 2000)
@@ -62,6 +67,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             acquire()
         }
 
+        histogram = findViewById(R.id.histogram)
+        previewFramesLabel = findViewById(R.id.previewFrames)
         preview = findViewById(R.id.preview)
         status = findViewById(R.id.status)
         connection = findViewById(R.id.connection)
@@ -253,6 +260,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val freeGb = stat.availableBytes.toDouble() / (1024.0 * 1024.0 * 1024.0)
         return JSONObject()
             .put("ok", true)
+            .put("preview_frames", cameraController?.previewFrames?.get() ?: 0)
             .put("battery_percent", battery)
             .put("charging", charging)
             .put("temperature_c", tempTenths / 10.0)
