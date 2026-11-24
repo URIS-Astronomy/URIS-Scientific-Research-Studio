@@ -1,0 +1,56 @@
+name: Publish verified TOD installation files
+on:
+  push:
+    branches: [tod-release-delivery-1273f79]
+    paths: [.github/workflows/tod-release-delivery.yml]
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45388617508
+          name: TOD-Astro-Photography-APK
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45388617508
+          name: TOD-Astro-Suite-Windows
+          path: windows
+      - name: Verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=release/TOD_Astro_Photography.apk
+          test -s "$apk"
+          unzip -t "$apk"
+          tools="$ANDROID_HOME/build-tools"
+          if ! find "$tools" -name apksigner -print -quit | grep -q .; then
+            sdkmanager 'build-tools;35.0.0'
+          fi
+          signer="$(find "$tools" -name apksigner | sort -V | tail -1)"
+          "$signer" verify --verbose "$apk"
+          test -s windows/TOD_Astro_Suite.exe
+          file windows/TOD_Astro_Suite.exe | grep -E 'PE32\+ executable.*x86-64'
+          for member in adb.exe AdbWinApi.dll AdbWinUsbApi.dll NOTICE.txt source.properties; do
+            test -s "windows/platform-tools/$member"
+          done
+          (cd windows && zip -r ../release/TOD_Astro_Suite_Windows_x64.zip TOD_Astro_Suite.exe platform-tools)
+          test -s release/TOD_Astro_Suite_Windows_x64.zip
+          unzip -t release/TOD_Astro_Suite_Windows_x64.zip
+          sha256sum release/*
+      - name: Publish both installation files
+        run: |
+          tag=tod-astro-suite-rc-1273f79
+          gh release create "$tag" --target 1273f7975072c6530a5f13c80ca8f210673bff84 --title 'TOD Astro Suite Engineering RC' --prerelease --draft --notes 'Installation files recovered from successful build 26 (1273f79). On Android, open the APK. On Windows x64, extract the entire ZIP and open TOD_Astro_Suite.exe. The ZIP includes the USB transport dependencies.' release/TOD_Astro_Photography.apk release/TOD_Astro_Suite_Windows_x64.zip
+          gh release edit "$tag" --draft=false
