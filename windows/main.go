@@ -191,6 +191,7 @@ type App struct {
 	reconnect        chan struct{}
 	captureDone      chan captureResult
 	captureID        string
+	captureSerial    atomic.Uint64
 	sequenceCancel   chan struct{}
 	sequenceFinished chan struct{}
 	sequenceStacking bool
@@ -1470,7 +1471,7 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord, single bool
 				a.currentControls = controls
 				a.mu.Unlock()
 			}
-			id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)
+			id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), a.captureSerial.Add(1))
 			if resume != nil && resume.PendingIndex == i && resume.PendingID != "" {
 				id = resume.PendingID
 			}
