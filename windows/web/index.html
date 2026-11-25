@@ -9,7 +9,7 @@
 <body>
 <div id="app">
   <aside class="sidebar">
-    <div class="brand"><img src="/assets/icon.png"/><div><div class="brand-title"><span>TOD</span> Astro Suite</div><div class="brand-sub">1.0.1 Stability RC</div></div></div>
+    <div class="brand"><img src="/assets/icon.png"/><div><div class="brand-title"><span>TOD</span> Astro Suite</div><div class="brand-sub">1.0.2 Capture RC</div></div></div>
     <nav id="nav">
       <button class="nav active" data-mode="Validation / Daylight"><span>◉</span><b>Validation / Daylight</b></button>
       <button class="nav" data-mode="Capture"><span>▢</span><b>Capture</b></button>
@@ -119,6 +119,8 @@
           <label class="field" id="maximumJpegRow" hidden><span>Maximum sensor JPEG <small id="maximumJpegSize"></small></span><input id="maximumJpeg" type="checkbox"/></label>
           <label class="field"><span>Frame count</span><input id="count" type="number" min="1" value="100" /></label>
           <label class="field"><span>Interval <small>ms</small></span><input id="interval" type="number" min="0" value="0" /></label>
+          <label class="field"><span>Save centered zoom JPEG</span><input type="checkbox" id="saveZoom" checked/></label>
+          <p class="hint" id="saveZoomHint">Single capture saves a cropped JPEG copy above 1× when JPEG is selected. Originals are preserved.</p>
           <div class="run-buttons"><button class="capture" id="singleBtn">Single capture</button><button class="primary" id="startSeqBtn">Start sequence</button></div>
           <div class="run-buttons">
             <label class="field"><span>Burst frames</span><input id="burstCount" type="number" min="2" max="16" value="5"/></label>
@@ -128,6 +130,10 @@
           <button class="danger full" id="stopSeqBtn">Stop capture</button>
           <div class="progress-card"><div class="progress-head"><b id="seqStatus">Idle</b><span id="seqCount">0 / 0</span></div><div class="progress"><i id="seqBar"></i></div></div>
           <div id="integration" role="status"></div>
+          <p class="hint" id="captureRoot"></p>
+          <button class="ghost full" id="chooseCaptureFolder">Choose save folder</button>
+          <output class="hint" id="savedCapture" role="status" hidden></output>
+          <button class="ghost full" id="openLastCaptureFolder" hidden>Open last capture folder</button>
           <div id="stackTools" hidden>
             <label class="field"><span>Show stack</span><input id="showStack" type="checkbox" checked /></label>
             <output id="stackStats"></output>

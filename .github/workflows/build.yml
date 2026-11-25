@@ -73,7 +73,7 @@ jobs:
               if ($app.HasExited) { throw "TOD Astro Suite exited before serving its dashboard" }
               try { $state = Invoke-RestMethod "$base/api/state" -TimeoutSec 1 } catch { Start-Sleep -Milliseconds 250 }
             }
-            if ($state.app -ne 'TOD Astro Suite' -or $state.version -ne '1.0.1 Stability RC') {
+            if ($state.app -ne 'TOD Astro Suite' -or $state.version -ne '1.0.2 Capture RC') {
               throw "The Windows executable did not serve the expected dashboard"
             }
             $report = Invoke-RestMethod "$base/api/diagnostics"

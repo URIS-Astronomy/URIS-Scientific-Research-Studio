@@ -1,7 +1,7 @@
 const $=id=>document.getElementById(id);let state=null,lastFocus=0,modeSignature="",awbSignature="";
 const hints={'Validation / Daylight':'Camera quality baseline with automatic exposure and focus',Capture:'Live telescope feed and camera control',Planetary:'Lucky-imaging workflow for Jupiter, Saturn and Mars','Lunar / Solar':'Surface-detail capture with clipping and focus aids','Deep Sky':'RAW still sequences, calibration frames and long-exposure sessions','Live Stack':'Register and stack light frames',Focus:'Large, readable focus metrics at the telescope',Sessions:'Target, files, telemetry and processing history'};
 async function api(path, body) {
-  const options = {signal: AbortSignal.timeout(path === '/api/state' ? 2500 : 12000), cache: 'no-store'};
+  const options = {signal: AbortSignal.timeout(path === '/api/capture-folder' ? 300000 : path === '/api/state' ? 2500 : 12000), cache: 'no-store'};
   if (body !== undefined) {
     options.method = 'POST';
     options.headers = {'Content-Type':'application/json'};
@@ -276,7 +276,7 @@ function parseVideoMode() {
   return match ? {width:+match[1],height:+match[2],fps:+(match[4] || match[3]),high_speed:!!match[5]} : null;
 }
 $('startVideoBtn').onclick=async()=>{try{await saveSession();await postControls();const v=parseVideoMode();if(!v)throw new Error("No video mode selected");if(v.high_speed && $('manualFocus').checked && !await confirmAction("Camera2 can override manual focus in high-speed mode. Start high-speed video?"))return;await api('/api/video/start',{...v,duration:+$('duration').value,frame_limit:+$('videoFrameLimit').value,target:$('targetInput').value,mode:currentMode(),rank_frames:$('rankFrames').checked})}catch(e){notify(e.message)}};$('stopVideoBtn').onclick=()=>api('/api/video/stop',{}).catch(e=>notify(e.message));
-$('applyBtn').onclick=()=>postControls().catch(notify);$('singleBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/capture',{maximum_jpeg:$('maximumJpeg').checked,raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw',target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value})}catch(e){notify(e.message)}};$('startSeqBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/sequence/start',{target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value,count:+$('count').value,interval_ms:+$('interval').value,calibration:calibrationSelection(),raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw'})}catch(e){notify(e.message)}};$('stopSeqBtn').onclick=()=>api('/api/sequence/stop',{}).catch(notify);$('reconnectBtn').onclick=()=>api('/api/reconnect',{}).catch(notify);$('manualConnectBtn').onclick=()=>api('/api/manual-connect',{host:$('manualIp').value}).catch(e=>notify(e.message));$('sirilBtn').onclick=()=>api('/api/siril',{calibration:calibrationSelection()}).catch(e=>notify(e.message));
+$('applyBtn').onclick=()=>postControls().catch(notify);$('singleBtn').onclick=async()=>{try{const saveZoom=$('saveZoom').checked && $('format').value!=='raw' ? zoomValue : 1;await saveSession();await postControls();await api('/api/capture',{save_zoom:saveZoom,maximum_jpeg:$('maximumJpeg').checked,raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw',target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value})}catch(e){notify(e.message)}};$('startSeqBtn').onclick=async()=>{try{await saveSession();await postControls();await api('/api/sequence/start',{target:$('targetInput').value,mode:currentMode(),frame_type:$('frameType').value,count:+$('count').value,interval_ms:+$('interval').value,calibration:calibrationSelection(),raw:$('format').value!=='jpeg',jpeg:$('format').value!=='raw'})}catch(e){notify(e.message)}};$('stopSeqBtn').onclick=()=>api('/api/sequence/stop',{}).catch(notify);$('reconnectBtn').onclick=()=>api('/api/reconnect',{}).catch(notify);$('manualConnectBtn').onclick=()=>api('/api/manual-connect',{host:$('manualIp').value}).catch(e=>notify(e.message));$('sirilBtn').onclick=()=>api('/api/siril',{calibration:calibrationSelection()}).catch(e=>notify(e.message));
 const workflowProfiles = {
   [validationName]:validationName, Planetary:'Jupiter', 'Lunar / Solar':'Moon',
   'Deep Sky':'Deep Sky', 'Live Stack':'Live Stack / EAA'
@@ -477,9 +477,38 @@ function renderFocus(metrics) {
   ctx.stroke();
 }
 
+let lastSavedAt, folderPickerPending=false;
+$('chooseCaptureFolder').onclick=async()=>{
+  folderPickerPending=true;
+  $('chooseCaptureFolder').disabled=true;
+  try {
+    const result=await api('/api/capture-folder',{});
+    if(result.changed) notify('Save folder updated for future captures.');
+  } catch (error) { notify(error); }
+  finally { folderPickerPending=false; }
+};
+$('openLastCaptureFolder').onclick=()=>api('/api/open-folder',{last_capture:true}).catch(notify);
+
 function renderWorkflow(s) {
   const ready = s.device.connected && Boolean(s.device.capabilities.camera_id ?? s.device.camera);
   const idle = !captureBusy(s);
+  $('captureRoot').textContent=s.session.root;
+  $('chooseCaptureFolder').disabled=!idle || folderPickerPending;
+  $('saveZoom').disabled=!idle || $('format').value==='raw';
+  $('saveZoomHint').textContent=$('format').value==='raw'
+    ? 'Choose JPEG or RAW + JPEG to save a zoomed JPEG copy.'
+    : 'Single capture saves a centered JPEG crop above 1×. Full-frame originals are preserved.';
+  const saved=s.last_saved;
+  $('savedCapture').hidden=!saved;
+  $('openLastCaptureFolder').hidden=!saved;
+  if(saved && saved.saved_at!==lastSavedAt) {
+    const names=saved.files.map(path=>path.split(/[\\/]/).at(-1));
+    $('savedCapture').textContent='Saved to PC · '+names.join(', ')+' · '+saved.folder;
+    $('savedCapture').title=saved.files.join('\n');
+    if(lastSavedAt!==undefined || s.sequence.running || Date.now()-Date.parse(saved.saved_at)<5000)
+      notify('Saved to PC · '+names.join(', '));
+    lastSavedAt=saved.saved_at;
+  }
   for (const id of ['profile','targetInput','frameType','format']) $(id).disabled = !idle;
   for (const id of ['applyBtn','singleBtn','startSeqBtn']) {
     $(id).disabled = !ready || !idle;

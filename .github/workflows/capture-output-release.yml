@@ -1,0 +1,105 @@
+name: Windows capture output release
+on:
+  push:
+    branches: [tod-capture-output-rc]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: windows/go.mod
+          cache: false
+      - name: Test and build
+        working-directory: windows
+        run: |
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check web/app.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -trimpath -ldflags="-s -w -H=windowsgui" -o ../TOD_Astro_Suite.exe .
+      - name: Verify executable starts and serves the new dashboard
+        run: |
+          $app = Start-Process -FilePath (Resolve-Path TOD_Astro_Suite.exe) -PassThru
+          $url = 'http://127.0.0.1:47871'
+          try {
+            $state = $null
+            for ($attempt = 0; $attempt -lt 30 -and !$state; $attempt++) {
+              if ($app.HasExited) { throw 'Executable exited before serving the dashboard' }
+              try { $state = Invoke-RestMethod "$url/api/state" -TimeoutSec 1 } catch { Start-Sleep -Milliseconds 250 }
+            }
+            if ($state.version -ne '1.0.2 Capture RC' -or !$state.session.root) { throw 'Unexpected dashboard state' }
+            $page = (Invoke-WebRequest "$url/").Content
+            if ($page -notmatch 'chooseCaptureFolder' -or $page -notmatch 'saveZoom' -or $page -notmatch 'savedCapture') {
+              throw 'Capture controls not served'
+            }
+            Invoke-RestMethod "$url/api/exit" -Method Post | Out-Null
+            if (!$app.WaitForExit(10000) -or $app.ExitCode -ne 0) { throw 'Application exit failed' }
+          } finally {
+            if (!$app.HasExited) { Stop-Process -Id $app.Id }
+          }
+      - name: Package the verified portable Windows distribution
+        run: |
+          $previous = Join-Path $env:RUNNER_TEMP 'previous.zip'
+          $bundle = Join-Path $env:RUNNER_TEMP 'tod-portable'
+          $asset = Join-Path $env:GITHUB_WORKSPACE 'TOD_Astro_Suite_Windows_x64-v1.0.2-rc.1.zip'
+          $base = 'https://github.com/URIS-Astronomy/URIS-Scientific-Research-Studio/releases/download/tod-astro-suite-v1.0.1-rc.1'
+          Invoke-WebRequest "$base/TOD_Astro_Suite_Windows_x64-v1.0.1-rc.1.zip" -OutFile $previous
+          if ((Get-FileHash $previous).Hash -ne 'dc09a3f912cf60d8db66bec39065feaf5a343af0dc9b7fd675e14b7b26301772') {
+            throw 'Portable dependency bundle checksum mismatch'
+          }
+          Expand-Archive $previous $bundle
+          Copy-Item TOD_Astro_Suite.exe $bundle -Force
+          Push-Location $bundle
+          7z a -tzip -mx=3 $asset TOD_Astro_Suite.exe platform-tools siril Siril-source.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          7z t $asset
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-Item $asset).Length -le 0) { throw 'Empty ZIP' }
+          Get-FileHash $asset
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tod-capture-windows
+          path: TOD_Astro_Suite_Windows_x64-v1.0.2-rc.1.zip
+          if-no-files-found: error
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tod-capture-windows
+      - name: Publish Windows capture update
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset=TOD_Astro_Suite_Windows_x64-v1.0.2-rc.1.zip
+          test -s "$asset"
+          unzip -tq "$asset"
+          unzip -p "$asset" TOD_Astro_Suite.exe > TOD_Astro_Suite.exe
+          file TOD_Astro_Suite.exe | grep -E 'PE32\+ executable.*x86-64'
+          cat > notes.md <<'NOTES'
+          Windows-only update. Keep your existing 1.0.1 RC 1 Android app.
+
+          - Single Capture confirms completed transfers with file names and a folder shortcut.
+          - Use Choose save folder to select the destination for future captures.
+          - With Save centered zoom JPEG enabled, Single Capture at more than 1× saves a centered crop alongside the original. Select JPEG or RAW + JPEG. RAW and original JPEG files retain their full frames.
+          - Review saved JPEG opens the latest JPEG, preferring the crop when one was requested. Validation JPEG still takes a fresh daylight shot.
+
+          Extract the entire archive, then open TOD_Astro_Suite.exe. The archive includes USB tools and Siril. Windows runner tests verify the executable and the dashboard. Physical telescope framing was not tested.
+          NOTES
+          tag=tod-astro-suite-v1.0.2-rc.1
+          gh release create "$tag" --target "$GITHUB_SHA" --draft --prerelease --title 'TOD Astro Suite 1.0.2 Capture RC 1' --notes-file notes.md "$asset"
+          gh release edit "$tag" --draft=false
+          gh release view "$tag" --json url,assets

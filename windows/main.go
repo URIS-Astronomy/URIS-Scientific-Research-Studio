@@ -30,7 +30,7 @@ import (
 
 const (
 	appName          = "TOD Astro Suite"
-	version          = "1.0.1 Stability RC"
+	version          = "1.0.2 Capture RC"
 	controlPort      = 47000
 	previewPort      = 47001
 	filePort         = 47002
@@ -120,6 +120,7 @@ type JPEGReview struct {
 }
 
 type StateSnapshot struct {
+	LastSaved  *savedCapture `json:"last_saved,omitempty"`
 	LastJPEG   *JPEGReview   `json:"last_jpeg,omitempty"`
 	FocusPoint *FocusPoint   `json:"focus_point,omitempty"`
 	App        string        `json:"app"`
@@ -144,6 +145,8 @@ type captureResult struct {
 }
 
 type App struct {
+	lastSaved        *savedCapture
+	captureZoom      float64
 	lastJPEG         *JPEGReview
 	focusPoint       *FocusPoint
 	active           endpoint
@@ -196,7 +199,7 @@ type App struct {
 }
 
 func newApp() *App {
-	pictures := filepath.Join(userHome(), "Pictures", "TOD Astro Photography")
+	pictures := loadCaptureRoot()
 	_ = os.MkdirAll(pictures, 0755)
 	path := lanPreferencePath()
 	var clientKey [16]byte
@@ -284,7 +287,7 @@ func (a *App) snapshot() StateSnapshot {
 	if !metrics.Live {
 		metrics.FPS, metrics.BitrateMbps = 0, 0
 	}
-	return StateSnapshot{LastJPEG: a.lastJPEG, FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: metrics, Video: a.video, Sequence: a.sequence, Session: s}
+	return StateSnapshot{LastSaved: a.lastSaved, LastJPEG: a.lastJPEG, FocusPoint: a.focusPoint, Stack: stack, App: appName, Version: version, Device: d, Metrics: metrics, Video: a.video, Sequence: a.sequence, Session: s}
 }
 func cloneMap(src map[string]any) map[string]any {
 	out := map[string]any{}
@@ -810,9 +813,14 @@ func (a *App) handleEvent(m map[string]any) {
 		if id != "" && id == a.captureID && a.sequence.Mode == "Live Stack" && frameType == "Light" && a.sequenceStacking {
 			stack = a.stack
 		}
+		zoom := 1.0
+		if id != "" && id == a.captureID {
+			zoom = a.captureZoom
+		}
 		a.mu.Unlock()
 		go func() {
 			var err error
+			saved := make([]string, 0, len(files)+1)
 			if len(files) == 0 {
 				err = fmt.Errorf("phone saved no files")
 			}
@@ -822,8 +830,18 @@ func (a *App) handleEvent(m map[string]any) {
 					err = transferErr
 					break
 				}
+				saved = append(saved, path)
 				if strings.EqualFold(filepath.Ext(path), ".jpg") {
 					a.rememberJPEG(path, m)
+					if zoom > 1 {
+						crop, cropErr := saveZoomJPEG(path, sessionDir, zoom)
+						if cropErr != nil {
+							err = fmt.Errorf("Original saved at %s. Zoom JPEG failed: %w", path, cropErr)
+						} else {
+							saved = append(saved, crop)
+							a.rememberJPEG(crop, map[string]any{"jpeg_processing": fmt.Sprintf("%.2f× centered zoom JPEG", zoom)})
+						}
+					}
 				}
 				if stack != nil && strings.EqualFold(filepath.Ext(path), stack.extension) {
 					if stackErr := stack.addFrame(path, int64(exposure)); stackErr != nil {
@@ -842,6 +860,9 @@ func (a *App) handleEvent(m map[string]any) {
 			}
 			a.mu.Lock()
 			delete(a.captureTransfers, id)
+			if len(saved) > 0 {
+				a.lastSaved = &savedCapture{Files: saved, Folder: filepath.Dir(saved[len(saved)-1]), SavedAt: time.Now()}
+			}
 			a.mu.Unlock()
 			a.completeCapture(captureResult{id: id, err: err})
 		}()
@@ -1342,6 +1363,10 @@ func (a *App) runSequence(req map[string]any, resume *SessionRecord, single bool
 	a.sequenceCancel = cancel
 	a.sequenceFinished = finished
 	a.sequenceStacking = stack != nil
+	a.captureZoom = 1
+	if zoom, ok := req["save_zoom"].(float64); single && ok && zoom > 1 && zoom <= 8 {
+		a.captureZoom = zoom
+	}
 	a.mu.Unlock()
 	raw, _ := req["raw"].(bool)
 	jpeg := true
@@ -1958,13 +1983,31 @@ func (a *App) routes() http.Handler {
 		a.mu.Unlock()
 		writeJSON(w, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("POST /api/capture-folder", func(w http.ResponseWriter, r *http.Request) {
+		a.mu.RLock()
+		root := a.session.Root
+		a.mu.RUnlock()
+		path, err := chooseCaptureFolder(r.Context(), root)
+		if err == nil && path != "" {
+			err = a.setCaptureRoot(path)
+		}
+		if err != nil {
+			writeErr(w, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "changed": path != ""})
+	})
 	mux.HandleFunc("POST /api/open-folder", func(w http.ResponseWriter, r *http.Request) {
 		var request struct {
-			ID string `json:"id"`
+			ID          string `json:"id"`
+			LastCapture bool   `json:"last_capture"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&request)
 		a.mu.RLock()
 		dir, root := a.session.CurrentDir, a.session.Root
+		if request.LastCapture && a.lastSaved != nil {
+			dir = a.lastSaved.Folder
+		}
 		a.mu.RUnlock()
 		if request.ID != "" {
 			var ok bool

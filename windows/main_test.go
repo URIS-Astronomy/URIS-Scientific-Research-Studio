@@ -70,7 +70,7 @@ func TestEmbeddedDashboardServesCaptureControls(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	handler := newApp().routes()
 	for path, content := range map[string]string{
-		"/":              "1.0.1 Stability RC",
+		"/":              "1.0.2 Capture RC",
 		"/assets/app.js": "/api/video/start",
 	} {
 		response := httptest.NewRecorder()
